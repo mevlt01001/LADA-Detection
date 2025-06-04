@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
-from create_detector_head import Head
+from create_detector_head import Head_p3, Head_p4, Head_p5
+import cv2, os
+import numpy as np
+import xml.etree.ElementTree as ET
 
 def get_cell_center(row, col, grid_size):
     """
@@ -124,28 +127,70 @@ def dist2bbox(dist_preds, cell_centers, reg_max=16, img_size=640, *, from_logits
 
     return torch.cat((boxes, class_preds), 1)              # [B,4+nc,H,W]
 
+def get_names(images_path):
+    files = os.listdir(images_path)
+    names = []
+    for file in files:
+        name, ext = os.path.splitext(file)
+        names.append(name)
+    return np.asarray(names)
+
+def get_image_and_label(name, images_path, labels_path, img_size=640):
+    img = cv2.imread(images_path + '/' + name + '.jpg')
+    w, h = img.shape[1], img.shape[0]
+    img = cv2.resize(img, (img_size, img_size))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.transpose(2, 0, 1)
+    img = np.expand_dims(img, axis=0)
+    img = torch.from_numpy(img).float()/255.0
+
+    tree = ET.parse(labels_path + '/' + name + '.xml')
+    root = tree.getroot()
+
+    labels = []
+    for obj in root.findall('object'):
+        name = obj.find('name').text
+        if not (name == "person"):
+            raise Exception("Not a person")
+        
+        bndbox = obj.find('bndbox')
+        x1 = float(bndbox.find('xmin').text)/w*img_size
+        y1 = float(bndbox.find('ymin').text)/h*img_size
+        x2 = float(bndbox.find('xmax').text)/w*img_size
+        y2 = float(bndbox.find('ymax').text)/h*img_size
+
+        # rescale to imgsize
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        w = x2 - x1
+        h = y2 - y1
+        labels.append([cx, cy, w, h])
+
+    return img, np.asarray(labels)
 
 
+images_path = "/home/neuron/datasets/head_detection/images"
+labels_path = "/home/neuron/datasets/head_detection/labels"
+names = get_names(images_path)
 
-reg_max, nc, gs = 12, 1, 160
-cxcywh_norm = torch.tensor([[0.2, 0.92, 0.1, 0.1]]) # 320,320,64,64
-cxcywh_pix  = cxcywh_norm * 640
-xyxy_pix    = cxcywh2xyxy(cxcywh_pix) # 
 
-dist = bbox2dist(gs, xyxy_pix, reg_max, nc)          # [1,49,gs,gs]
-centers = get_all_cell_centers(gs)                   # [gs,gs,2]
-out = dist2bbox(dist, centers, reg_max, from_logits=False)              # [1,4+nc,gs,gs]
+# train p3
+epoch = 10
+batch_size = 4
+img_size = 640
 
-# En yüksek class skorunun olduğu hücre
-scores = out[:,4,:,:][0]                                # [1,gs,gs]
-row, col = torch.nonzero(scores==scores.max(), as_tuple=True)
-print('recovered xyxy :', out[0,:4,row,col])         # ≈ orijinal kutu (piksel)
-xyxy = out[0,:4,row,col]
-cx = (xyxy[0] + xyxy[2]) * 0.5
-cy = (xyxy[1] + xyxy[3]) * 0.5
-w = xyxy[2] - xyxy[0]
-h = xyxy[3] - xyxy[1]
-print('recovered cxcywh :', torch.tensor([cx, cy, w, h])/640) # output: recovered cxcywh : tensor([0.5170, 0.5170, 0.3971, 0.3971])
+for i in range(epoch):
+    batch_idx = 0
+    images = []
+    labels = []
+    
+    for name in names[batch_idx:batch_idx+batch_size]:
+        img, labels = get_image_and_label(name, images_path, labels_path, img_size=img_size)
+        images.append(img)
+        labels.append(labels)
+        batch_idx += batch_size
 
+    
+    
 
 

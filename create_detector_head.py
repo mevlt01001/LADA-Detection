@@ -39,23 +39,86 @@ class Head(nn.Module):
         p5 = torch.cat((self.cv2[2](f3), self.cv3[2](f3)), 1)
 
         return p3, p4, p5
+    
+
+class Head_p3(Head):
+    def __init__(self, nc=1, f_ch=[640, 1024, 1280], ch=[128, 128, 128]):
+        super().__init__(nc, f_ch, ch)
+
+    def forward(self, f1, targets=None):
+        f1 = self.f1_conv(f1)
+        f1 = torch.nn.functional.interpolate(f1, scale_factor=1.5, mode="nearest")
+        p3 = torch.cat((self.cv2[0](f1), self.cv3[0](f1)), 1)
+        return p3
+    
+class Head_p4(Head):
+    def __init__(self, nc=1, f_ch=[640, 1024, 1280], ch=[128, 128, 128]):
+        super().__init__(nc, f_ch, ch)
+
+    def forward(self, f2, targets=None):
+        f2 = self.f2_conv(f2)
+        f2 = torch.nn.functional.interpolate(f2, scale_factor=1.5, mode="nearest")
+        p4 = torch.cat((self.cv2[1](f2), self.cv3[1](f2)), 1)
+        return p4
+
+class Head_p5(Head):
+    def __init__(self, nc=1, f_ch=[640, 1024, 1280], ch=[128, 128, 128]):
+        super().__init__(nc, f_ch, ch)
+
+    def forward(self, f3, targets=None):
+        f3 = self.f3_conv(f3)
+        f3 = torch.nn.functional.interpolate(f3, scale_factor=1.5, mode="nearest")
+        p5 = torch.cat((self.cv2[2](f3), self.cv3[2](f3)), 1)
+        return p5
 
     
 # torch.onnx.export(
-#     model=Head(),
+#     model=Head_p3(),
 #     args=(
 #         torch.randn([1,640,80,80], dtype=torch.float32),
-#         torch.randn([1,1024,40,40], dtype=torch.float32),
-#         torch.randn([1,1280,20,20], dtype=torch.float32)
 #     ),
-#     f="onnx_folder/head.onnx",
+#     f="onnx_folder/head_p3.onnx",
 #     opset_version=19,
-#     input_names=["p3","p4","p5"],
-#     output_names=["f1", "f2", "f3"],
+#     input_names=["p3"],
+#     output_names=["f1"],
 # )
 
 # import onnx, onnxsim
 
-# head_onnx = onnx.load("onnx_folder/head.onnx")
+# head_onnx = onnx.load("onnx_folder/head_p3.onnx")
 # head_onnx, check = onnxsim.simplify(head_onnx)
-# onnx.save(head_onnx, "onnx_folder/head.onnx")
+# onnx.save(head_onnx, "onnx_folder/head_p3.onnx")
+
+# torch.onnx.export(
+#     model=Head_p4(),
+#     args=(
+#         torch.randn([1,1024,40,40], dtype=torch.float32),
+#     ),
+#     f="onnx_folder/head_p4.onnx",
+#     opset_version=19,
+#     input_names=["p4"],
+#     output_names=["f2"],
+# )
+
+# import onnx, onnxsim
+
+# head_onnx = onnx.load("onnx_folder/head_p4.onnx")
+# head_onnx, check = onnxsim.simplify(head_onnx)
+# onnx.save(head_onnx, "onnx_folder/head_p4.onnx")
+
+# torch.onnx.export(
+#     model=Head_p5(),
+#     args=(
+#         torch.randn([1,1280,20,20], dtype=torch.float32),
+#     ),
+#     f="onnx_folder/head_p5.onnx",
+#     opset_version=19,
+#     input_names=["p5"],
+#     output_names=["f3"],
+# )
+
+# import onnx, onnxsim
+
+# head_onnx = onnx.load("onnx_folder/head_p5.onnx")
+# head_onnx, check = onnxsim.simplify(head_onnx)
+# onnx.save(head_onnx, "onnx_folder/head_p5.onnx")
