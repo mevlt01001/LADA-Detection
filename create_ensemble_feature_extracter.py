@@ -45,6 +45,20 @@ class ensemble_pre(torch.nn.Module):
         super(ensemble_pre, self).__init__()
         
     def forward(self, x):
+        # x.shape is (H,W,3)
+        # output.shape is (1,3,640,640)
+
+        
+        x = x.permute(2, 0, 1)
+        x = torch.cat([
+            x[2:3, ...],
+            x[1:2, ...],
+            x[0:1, ...],
+        ], dim=0).unsqueeze(0)
+        x = torch.nn.functional.interpolate(x, size=(640, 640), mode='bilinear')
+        x = x*(1/255.0)
+
+        
         return x,x
 
 torch.onnx.export(
@@ -63,11 +77,12 @@ torch.onnx.export(
 
 torch.onnx.export(
     model=ensemble_pre(),
-    args=(torch.randn([1,3,640,640], dtype=torch.float32),),
+    args=(torch.randn([640,640,3], dtype=torch.float32),),
     f="onnx_folder/ensemble_pre.onnx",
     opset_version=19,
     input_names=["in"],
     output_names=["in1", "in2"],
+    dynamic_axes={"in": {0: "H", 1: "W"}}
 )
 
 ensemble_post_onnx = onnx.load("onnx_folder/ensemble_post.onnx")
