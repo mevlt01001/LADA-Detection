@@ -8,7 +8,7 @@ class Head(nn.Module):
         self.f2_conv = nn.Conv2d(f_ch[1], ch[1], 1)
         self.f3_conv = nn.Conv2d(f_ch[2], ch[2], 1)
         self.nc = nc
-        self.reg_max = 12
+        self.reg_max = 16
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch

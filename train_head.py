@@ -5,7 +5,6 @@ import cv2, os
 import numpy as np
 import xml.etree.ElementTree as ET
 import onnxruntime
-import random
 
 def get_cell_center(row, col, grid_size):
     """
@@ -113,28 +112,25 @@ def assign_C1_anchor_points(grid_size, boxes_xyxy, reg_max=12, img_size=640):
 
     return final_grids_and_boxes
 
-def dist2bbox(dist_preds, reg_max=12, img_size=640, *, from_logits=True):
+def dist2bbox(dist_preds, reg_max=12, img_size=640, from_logits=True):
     """
     dist_preds : [B, 4*reg_max + nc, H, W]
     cell_centers: [H, W, 2]  (cx, cy) piksel
     """
+
     B, C, H, W = dist_preds.shape
     stride = img_size / H
 
-    # 1) Ayrıştır
     class_preds = dist_preds[:, 4*reg_max:, ...]          # [B,nc,H,W]
     dist_preds  = dist_preds[:, :4*reg_max, ...]          # [B,4*reg_max,H,W]
 
-    # 2) LTRB dağılımını olasılığa çevir
     preds = dist_preds.view(B, 4, reg_max, H, W)
     if from_logits:
         preds = preds.softmax(2)                          # [B,4,R,H,W]
 
-    # 3) Beklenen değer
     project = torch.arange(reg_max, device=preds.device, dtype=preds.dtype)
     dist = (preds * project[None, None, :, None, None]).sum(2) * stride  # [B,4,H,W]
 
-    # 4) Piksele projeksiyon
     cell_centers = get_all_cell_centers(H, img_size=img_size, device=dist.device)
     cx = cell_centers[..., 0].to(dist.dtype).unsqueeze(0)  # [1,H,W]
     cy = cell_centers[..., 1].to(dist.dtype).unsqueeze(0)
@@ -187,63 +183,53 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
         return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/abs/1902.09630
     return iou  # IoU
 
-def select_best_k_points(assignment_map, decoded_preds, boxes_xyxy, k=5, nc=1):
+def select_best_k_points(assignment_map, decoded_preds, k=5, epoch=0):
 
-    # Adım 0: Tahminleri ve Adayları Hazırlama
     box_preds = decoded_preds[0, :4, ...].permute(1, 2, 0)   # (H, W, 4)
     cls_preds = decoded_preds[0, 4:, ...].permute(1, 2, 0) # (H, W, nc)
     
-    # Adım 1: Her Aday İçin Kalite/Uyum Puanı Hesaplama
     candidates_with_scores = []
     for point, gt_box_list in assignment_map.items():
         p_row, p_col = point
         
-        # Atanmış GT kutusunu ve o noktadaki tahminleri al
-        # Not: Girdileri torch tensörüne çeviriyoruz
-        gt_box_tensor = torch.tensor(gt_box_list[0], dtype=torch.float32).unsqueeze(0)
+        gt_box_tensor = torch.tensor(gt_box_list[0], dtype=torch.float32, device=box_preds.device).unsqueeze(0)
         pred_box_tensor = box_preds[p_row, p_col, :].unsqueeze(0)
 
-        # Regresyon kalitesi: CIoU skoru
         iou_score = bbox_iou(gt_box_tensor, pred_box_tensor, CIoU=True, xywh=False)
         
-        # Sınıflandırma kalitesi: Doğru sınıf için tahmin skoru
-        # nc=1 olduğu için sadece ilk skoru alıyoruz
         class_score = cls_preds[p_row, p_col, 0].sigmoid()
         
-        # Nihai Uyum Puanı
         alignment_score = iou_score * class_score
         
         candidates_with_scores.append({
             'point': point,
-            'gt_box_tuple': tuple(gt_box_list[0]), # Sözlük anahtarı için tuple'a çevir
-            'score': alignment_score.item() # Skoru float olarak sakla
+            'gt_box_tuple': tuple(gt_box_list[0]), 
+            'score': alignment_score.item()
         })
         
-    # Adım 2: Adayları GT Kutularına Göre Gruplama
     candidates_by_gt = {}
     for cand in candidates_with_scores:
         gt_key = cand['gt_box_tuple']
         if gt_key not in candidates_by_gt: candidates_by_gt[gt_key] = []
         candidates_by_gt[gt_key].append(cand)
         
-    # Adım 3: Her GT İçin Top-k Seçimi
     final_positives_map = {}
     for gt_key, candidate_list in candidates_by_gt.items():
-        # Uyum puanına göre büyükten küçüğe doğru sırala
         candidate_list.sort(key=lambda c: c['score'], reverse=True)
-        
-        # En iyi k tanesini seç
-        top_k_candidates = candidate_list[:k]
-        
-        # Sonuç haritasını doldur
+
+        if epoch == 0:
+                top_k_candidates = candidate_list
+        else:
+            topk = min(k, len(candidate_list))
+            top_k_candidates = candidate_list[:topk]
+
         for cand in top_k_candidates:
-            # Değeri tekrar listeye çevirerek orijinal formatı koru
             final_positives_map[cand['point']] = [list(cand['gt_box_tuple'])]
             
     return final_positives_map
 
 def create_targets(positive_assignments, grid_size, reg_max=12, nc=1, img_size=640, device='cpu'):
-    # Bu fonksiyona da 'device' parametresi ekleyelim ki her şey tutarlı olsun
+
     assert img_size == 640, "img_size must be 640"
     stride = img_size / grid_size
     target = torch.zeros(1, 4 * reg_max + nc, grid_size, grid_size, dtype=torch.float32, device=device)
@@ -262,13 +248,11 @@ def create_targets(positive_assignments, grid_size, reg_max=12, nc=1, img_size=6
         
     return target
 
-def decode_boxes_from_dfl(dfl_dist, anchor_points_centers, stride, reg_max, from_logits=True):
-    # Düzeltme 3: from_logits parametresi eklendi
-    if from_logits:
-        dfl_dist = dfl_dist.view(-1, 4, reg_max).softmax(2)
-    else:
-        dfl_dist = dfl_dist.view(-1, 4, reg_max) # Zaten olasılık, sadece şekillendir
+def decode_boxes_from_dfl(pred_dist, anchor_points_centers, stride, reg_max, from_logits=False):
 
+    dfl_dist = pred_dist.view(-1, 4, reg_max)
+    if from_logits:
+        dfl_dist = F.softmax(dfl_dist, dim=2)
     project = torch.arange(reg_max, device=dfl_dist.device, dtype=torch.float32)
     distances = (dfl_dist * project).sum(2)
     l_px, t_px, r_px, b_px = (distances * stride).chunk(4, dim=1)
@@ -276,49 +260,58 @@ def decode_boxes_from_dfl(dfl_dist, anchor_points_centers, stride, reg_max, from
     return torch.cat([cx - l_px, cy - t_px, cx + r_px, cy + b_px], dim=1)
 
 def compute_loss(preds, targets, grid_size, reg_max=12, nc=1, img_size=640):
-    # Bu fonksiyonun içinde Düzeltme 3'ü uygulamış oluyoruz.
     device = preds.device
     B, C, H, W = preds.shape
-    stride = img_size / H
     
+    # ... (pos_mask ve loss_cls hesaplamaları önceki gibi doğru) ...
     target_cls = targets[:, 4 * reg_max:, :, :]
     pos_mask = (target_cls > 0).any(dim=1)
     num_pos = pos_mask.sum()
 
     if num_pos == 0:
         pred_scores = preds[:, 4 * reg_max:, :, :]
-        loss_cls = torchvision.ops.sigmoid_focal_loss(pred_scores, target_cls, alpha=0.25, gamma=2.0, reduction='mean')
-        return loss_cls, torch.tensor([0.0, 0.0, loss_cls.item()], device=device)
+        loss_cls = torchvision.ops.sigmoid_focal_loss(pred_scores, target_cls, alpha=0.75, gamma=2.0, reduction='mean')
+        return loss_cls, torch.tensor([0.0, 0.0, loss_cls], device=device)
 
     pred_scores = preds[:, 4 * reg_max:, :, :]
-    loss_cls = torchvision.ops.sigmoid_focal_loss(inputs=pred_scores, targets=target_cls, alpha=0.25, gamma=2.0, reduction='sum') / num_pos
+    loss_cls = torchvision.ops.sigmoid_focal_loss(inputs=pred_scores, targets=target_cls, alpha=0.75, gamma=2.0, reduction='sum') / num_pos
     
+    # Pozitif örnekleri seçme
     pos_mask_flat = pos_mask.view(-1)
     preds_flat = preds.permute(0, 2, 3, 1).reshape(-1, C)
     pos_preds = preds_flat[pos_mask_flat]
-    
     targets_flat = targets.permute(0, 2, 3, 1).reshape(-1, C)
     pos_targets = targets_flat[pos_mask_flat]
     
+    # --- DFL KAYBI İÇİN DOĞRU HESAPLAMA (SENİN DÜZELTMENLE) ---
     target_dist = pos_targets[:, :4 * reg_max]
     pred_dist_logits = pos_preds[:, :4 * reg_max]
-    
-    loss_dfl = F.kl_div(F.log_softmax(pred_dist_logits, dim=1), target_dist, reduction='batchmean') * (reg_max / 4.0)
 
+    # Dağılımları 4 ayrı grup olarak yeniden şekillendir: [num_pos, 4, reg_max]
+    pred_dist_logits_reshaped = pred_dist_logits.view(-1, 4, reg_max)
+    target_dist_reshaped = target_dist.view(-1, 4, reg_max)
+    
+    # Softmax'ı her bir 4 dağılım için reg_max boyutu (dim=2) boyunca uygula
+    loss_dfl = F.kl_div(
+        F.log_softmax(pred_dist_logits_reshaped, dim=2), 
+        target_dist_reshaped, 
+        reduction='batchmean'
+    )
+
+    # --- Kutu Regresyon Kaybı (L_box) ---
+    # ... (Bu kısım aynı kalır, decode_boxes_from_dfl de artık bu mantığa göre çalışır) ...
+    stride = img_size / H
     all_cell_centers = get_all_cell_centers(H, img_size=img_size, device=device)
     pos_anchor_centers = all_cell_centers.view(-1, 2)[pos_mask_flat]
     
-    # Düzeltme 3'ün uygulanması:
     pred_boxes_pos = decode_boxes_from_dfl(pred_dist_logits, pos_anchor_centers, stride, reg_max, from_logits=True)
-    target_boxes_pos = decode_boxes_from_dfl(target_dist, pos_anchor_centers, stride, reg_max, from_logits=False) # <- Değişiklik
+    target_boxes_pos = decode_boxes_from_dfl(target_dist, pos_anchor_centers, stride, reg_max, from_logits=False)
     
     iou = bbox_iou(pred_boxes_pos, target_boxes_pos, CIoU=True, xywh=False)
     loss_box = (1.0 - iou).mean()
     
-    w_cls, w_dfl, w_box = 0.5, 1.5, 7.5
-    total_loss = (loss_cls * w_cls) + (loss_dfl * w_dfl) + (loss_box * w_box)
-    
-    return total_loss, torch.stack([loss_box, loss_dfl, loss_cls]).detach()
+    # Toplam Kayıp
+    w_cls, w_dfl, w_box = 0.5,1.5,7.5
     total_loss = (loss_cls * w_cls) + (loss_dfl * w_dfl) + (loss_box * w_box)
     
     return total_loss, torch.stack([loss_box, loss_dfl, loss_cls]).detach()
@@ -459,16 +452,24 @@ def DFL_decode(distributed_preds, reg_max, img_size, nc=1, conf_thresh=0.25, iou
         final_class_ids.unsqueeze(1)
     ], dim=1)
 
+def create_target_dist(gt_boxes, pred_dist, nc=1, grid_size=120, reg_max=12, img_size=640, max_k=10, epoch=0):
+    with torch.no_grad():
+        assignmets_map = assign_C1_anchor_points(grid_size, gt_boxes, reg_max, img_size)
+        pred_boxes = dist2bbox(pred_dist, reg_max, img_size)
+        positive_assignments = select_best_k_points(assignmets_map, pred_boxes, k=max_k, epoch=epoch)
+        targets = create_targets(positive_assignments, grid_size=grid_size, reg_max=reg_max, nc=nc)
+        return targets
 
 
 if __name__ == '__main__':
-    EPOCHS = 100
+    EPOCHS = 20
     BATCH_SIZE = 4
     IMG_SIZE = 640
-    LEARNING_RATE = 0.005
-    REG_MAX = 12
+    LEARNING_RATE = 0.01
+    GRID_SIZE = 120
+    REG_MAX = 16
     NC = 1 # Sınıf sayısı
-    K_BEST = 10 # Her GT için seçilecek en iyi aday sayısı
+    K_BEST = 12 # Her GT için seçilecek en iyi aday sayısı
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -481,16 +482,79 @@ if __name__ == '__main__':
     # ONNX modelini yükle (sadece özellik çıkarımı için, eğitilmeyecek)
     ensemble_model = onnxruntime.InferenceSession("onnx_folder/ensemble_model.onnx", providers=['CUDAExecutionProvider'])
 
-    model = Head_p3(nc=NC, f_ch=[640, 1024, 1280], ch=[128, 128, 128]).to(device)
+    model = Head_p3(nc=NC, f_ch=[640, 1024, 1280], ch=[128, 128, 128]).to(device).train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.635)
+    total_loses = []
+    cls_losses = []
+    dfl_losses = []
+    reg_losses = []
+    best_loss = float('inf')
 
     # 3. Eğitim
+
     for epoch in range(EPOCHS):
+        epoch_total_loss = 0.0
+        epoch_cls_loss = 0.0
+        epoch_dfl_loss = 0.0
+        epoch_reg_loss = 0.0
+
         for batch_start in range(0, len(names), BATCH_SIZE):
+            optimizer.zero_grad()
+
             batch_end = min(batch_start + BATCH_SIZE, len(names))
             batch = names[batch_start:batch_end]
             images, gt = get_images_and_xyxy(batch, images_path, labels_path, img_size=IMG_SIZE) # np.ndarray, python nested list
-            for image, xyxy_gt in zip(images, gt):
-                feat_3, feat4, feat5 = ensemble_model.run(None, {'in': image})
-                #......
+
+            batch_loss = []
+            batch_cls_loss = []
+            batch_dfl_loss = []
+            batch_box_loss = []
+
+            for image, xyxy_gt in zip(images, gt): # her resim ve labeli için
+                feats, *_ = ensemble_model.run(None, {'in': image}) 
+                feats = torch.from_numpy(feats).to(device) 
+                dist_pred = model.forward(feats) # 1, 4xregmax+nc, gs, gs
+                dist_target = create_target_dist(xyxy_gt, dist_pred, nc=NC, grid_size=GRID_SIZE, reg_max=REG_MAX, img_size=IMG_SIZE, max_k=K_BEST, epoch=epoch).to(device)
+                loss, loss_details = compute_loss(dist_pred, dist_target, grid_size=GRID_SIZE, reg_max=REG_MAX, nc=NC)
+
+                batch_loss.append(loss)
+                batch_cls_loss.append(loss_details[2].item())
+                batch_dfl_loss.append(loss_details[1].item())
+                batch_box_loss.append(loss_details[0].item())
+
+            if batch_loss:
+
+                batch_loss = torch.stack(batch_loss).mean()
+                batch_cls_loss_val = np.mean(batch_cls_loss)
+                batch_dfl_loss_val = np.mean(batch_dfl_loss)
+                batch_box_loss_val = np.mean(batch_box_loss)
+
+                batch_loss.backward()
+                optimizer.step()
+                if batch_loss.item() < best_loss:
+                    best_loss = batch_loss.item()
+                print(f"LR: {scheduler.get_last_lr()}, Epoch: {epoch+1}/{EPOCHS}, Batch: {batch_end}/{len(names)}, Best Loss: {best_loss:.4f}, Current Loss: {batch_loss.item():.4f}, boxL: {batch_box_loss_val:.4f}, clsL: {batch_cls_loss_val:.8f}, DFL: {batch_dfl_loss_val:.8f}")
+                scheduler.step()
+                total_loses.append(batch_loss.item())
+                cls_losses.append(batch_cls_loss_val)
+                dfl_losses.append(batch_dfl_loss_val)
+                reg_losses.append(batch_box_loss_val)
+
+                torch.save(model.state_dict(), f'trained_models/model_e{epoch+1}_b{batch_start//BATCH_SIZE}_l{batch_loss.item():4f}.pt')
+                
+
+    import matplotlib.pyplot as plt
+    plt.plot(total_loses, label='Total Loss')
+    plt.plot(cls_losses, label='Cls Loss', marker='.-.')
+    plt.plot(dfl_losses, label='DFL Loss', marker='.-.')
+    plt.plot(reg_losses, label='Reg Loss', marker='.-.')
+    plt.ylabel('Loss')
+    plt.xlabel('iteration')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('losses.png')
+        
+
+                
 
