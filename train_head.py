@@ -460,7 +460,7 @@ def create_target_dist(gt_boxes, pred_dist, nc=1, grid_size=120, reg_max=12, img
         targets = create_targets(positive_assignments, grid_size=grid_size, reg_max=reg_max, nc=nc)
         return targets
 
-
+os.makedirs("trained_models", exist_ok=True)
 if __name__ == '__main__':
     EPOCHS = 20
     BATCH_SIZE = 4
