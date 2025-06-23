@@ -2,3 +2,9 @@
 *.pt
 *.engine
 __pycache__/
+*demo*
+*.mp4*
+*.png*
+*.jpg*
+*.jpeg*
+average_precision/
