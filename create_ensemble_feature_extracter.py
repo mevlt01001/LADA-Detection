@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from ultralytics.engine.model import Model as UltrlyticsModel
 from ultralytics.models.yolo import YOLO
 from ultralytics.models.rtdetr import RTDETR
@@ -96,60 +98,120 @@ class Head(nn.Module):
         return outputs
 
 class DFL(nn.Module):
-    def __init__(self, regmax, strides, device=torch.device("cpu")):
+    def __init__(self, strides, imgsz=640, nc=80, regmax=16, device=torch.device("cpu")):
         super().__init__()
         self.regmax = regmax
+        self.device = device
+        self.nc = nc
+        self.proj = torch.arange(0, self.regmax).view(1, -1, 1, 1, 1).float().to(device)
         self.strides = strides
-        self.regmax_tensor = torch.arange(self.regmax, device=device).view(1,1,self.regmax,1,1)
-        
+        self.imgsz = imgsz
+    
+    def forward(self, x: list[torch.Tensor]):
+        return self.decode(x)
 
-    def forward(self, x):
+    def decode(self, x: list[torch.Tensor]):
         # x = [[1,4*regmax+nc,80,80],[1,4*regmax+nc,40,40],[1,4*regmax+nc,20,20]]
-        B, C, H, W = x[0].shape
-        dist_ltrb = [ch[:, :4 * self.regmax].view(B, 4, self.regmax, ch.shape[2], ch.shape[3]) for ch in x]
-        dist_ltrb = [torch.softmax(ch, dim=2) for ch in dist_ltrb]
-        dist_ltrb = [ch*self.regmax_tensor for ch in dist_ltrb]
-        ltrb = [torch.sum(ch, dim=2)*st for ch,st in zip(dist_ltrb, self.strides)]
-        xyxy = [cxcywh2xyxy(ch) for ch in ltrb] # code ltrb to xyxy
+        B, *_ = x[0].shape
+        reg_preds = [p[:, :4 * self.regmax].reshape(B, self.regmax, 4, p.shape[-2], p.shape[-1]) for p in x]
+        reg_preds = [torch.softmax(p, 1)*self.proj for p in reg_preds]
+        reg_preds = [torch.sum(p, 1)*self.strides[idx] for idx, p in enumerate(reg_preds)]
+        reg_preds = [self.ltrb2xyxy(p) for p in reg_preds]
+        cls_preds = [p[:, 4 * self.regmax:].reshape(B, self.nc, p.shape[-2], p.shape[-1]) for p in x]
+        cls_preds = [torch.softmax(p, 1) for p in cls_preds]
+        out = [torch.cat((r, c), 1) for r, c in zip(reg_preds, cls_preds)]
+        return out
 
-        cls_score = [ch[:, 4 * self.regmax:] for ch in x]
+    def encode(self, boxes: torch.Tensor):
+        # boxes = [n,4]
+        pass
 
-        print(f"dist_ltrb: {[d.shape for d in ltrb]}")
-        print(f"cls_score: {[c.shape for c in cls_score]}")
-
-        return [ltrb.reshape(B, 4, -1) for ltrb in ltrb]
+    def ltrb2xyxy(self, dist_reg: torch.Tensor):
+        # dist_reg = [n,4,ch,ch]
+        B, _, _, W = dist_reg.shape
+        stride = self.imgsz // W
+        device = dist_reg.device
+        cellx, celly = torch.meshgrid(torch.arange(W), torch.arange(W), indexing='xy')
+        cx = (cellx + 0.5).to(device) * stride
+        cy = (celly + 0.5).to(device) * stride
+        l, t, r, b = dist_reg[:, 0], dist_reg[:, 1], dist_reg[:, 2], dist_reg[:, 3]
+        x1 = cx - l; y1 = cy - t; x2 = cx + r; y2 = cy + b
+        return torch.stack((x1, y1, x2, y2), 1)
 
 class Model(nn.Module):
     def __init__(self, models: list[UltrlyticsModel], nc=80, regmax=16, device=torch.device("cpu")):
         super().__init__()
         self.body = HybridNet(models=models, device=device)        
         self.head = Head(nc=nc, regmax=regmax, in_ch=self.body.out_ch, device=device)
-        self.dfl = DFL(regmax=regmax, strides=self.body.strides, device=device)
+        self.dfl = DFL(strides=self.body.strides, imgsz=self.body.imgsz, nc=nc, regmax=regmax, device=device)
     
-    def forward(self, x):
+    def forward(self, x, train:bool=False):
         x = self.body(x)
         x = self.head(x)
-        x = self.dfl(x)
+        x = self.dfl(x) if not train else x
         return x
+    
+class ModelTrainer:
+    def __init__(self, model:Model):
+        self.model = model
+        self.strides = model.body.strides
+        self.imgsz = model.body.imgsz
+        self.nc = model.dfl.nc
+        self.regmax = model.dfl.regmax
+
+    def create_targets(self, gt_boxes:np.ndarray, preds:list[torch.Tensor], epoch:int, k:int=13):
+        # gt_boxes = [n,5], box format (cls_id,cx,cy,w,h), not normalized (0-imgsz)
+        # preds = [[1,4*regmax+nc,p3,p3],[1,4*regmax+nc,p4,p4],[1,4*regmax+nc,p5,p5]]
+        
+        pass
+
+    
+    def create_c1_targets(self, target_imgsz:tuple, gt_boxes:torch.Tensor):
+        # gt_boxes = [n,5], box format (cls_id,cx,cy,w,h), normalized (0-1)
+        # preds = [[1,4*regmax+nc,p3,p3],[1,4*regmax+nc,p4,p4],[1,4*regmax+nc,p5,p5]]
+
+        H,W = target_imgsz
+        gt_boxes[:, [1, 3]]/=W
+        gt_boxes[:, [2, 4]]/=H
+
+        labels = [torch.zeros(1, self.regmax*4+self.nc, self.imgsz//st, self.imgsz//st) for st in self.strides]
+        assignments = []
+
+        r = lambda s: np.sqrt((s*(1/max(self.strides))))
+        positive_areas = lambda s, gt: [gt[0]*s, gt[1]*s, gt[2]*r(s)*s, gt[3]*r(s)*s]
+
+
+        for lb,st in zip(labels, self.strides):
+            for box in gt_boxes:
+                px, py, pw, ph = positive_areas(st, box) # GT Box positive area 
+                for j in range(self.imgsz//st):
+                    for i in range(self.imgsz//st):
+                        if px < i < px + pw and py < j < py + ph: # Check grid cell if in positive area
+                            
+
+
+
+
+
+
+
+
+
+
+            
 
 model1 = YOLO("pt_folder/yolo12l.pt")
 model2 = RTDETR("pt_folder/rtdetr-l.pt")
 device = torch.device("cuda")
 
 model = Model(models=[model1, model2], nc=80, regmax=16, device=device)
-input_data = torch.randn(1, 3, 640, 640, device=device)
+dfl = DFL(strides=model.body.strides, imgsz=model.body.imgsz, nc=80, regmax=16, device=device)
+trainer = ModelTrainer(model)
 
-torch.onnx.export(
-    model,
-    input_data,
-    "onnx_folder/ensemble_feature_extracter.onnx",
-    export_params=True,
-    opset_version=19,
-    input_names=["input"],
-    output_names=["f3", "f2", "f1"],
-)
-import onnx, onnxsim
-model = onnx.load("onnx_folder/ensemble_feature_extracter.onnx")
-model, check = onnxsim.simplify(model)
-model = onnx.shape_inference.infer_shapes(model)
-onnx.save(model, "onnx_folder/ensemble_feature_extracter.onnx")
+data = torch.randint(0, 80, (3, 5))
+trainer.create_c1_targets((3,4), data.to(torch.float32))
+
+k=20
+input_data = torch.randn(1, 3, int(32*k), int(32*k), device=device)
+
+print([p.shape for p in model.forward(input_data, train=False)])
