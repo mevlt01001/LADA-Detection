@@ -242,9 +242,21 @@ class ModelTrainer:
         # data = json["annotations"]
         pass
 
-    def calc_loss(preds, targets):
+    def calc_loss(self, preds:list[torch.Tensor], targets: list[torch.Tensor]):
         # TODO: calc loss with DFL + Focal Loss + CIoULoss for each stride
-        pass
+        # preds = [[1,4*regmax+nc,p3,p3],...,[1,4*regmax+nc,p5,p5]]
+        # Targets = [[1,4*regmax+nc,p3,p3],...,[1,4*regmax+nc,p5,p5]]
+        
+        # calc DFL
+        DistPreds = [pred[0, :4*self.regmax].reshape(4, self.regmax, pred.shape[-1], pred.shape[-1]).softmax(dim=1) for pred in preds]
+        DistTargets = [target[0, :4*self.regmax].reshape(4, self.regmax, target.shape[-1], target.shape[-1]) for target in targets]
+        DFL = 0
+        for pred in DistPreds:
+            for target in DistTargets:
+                if pred.shape == target.shape:
+                    pass
+                pass
+        # TODO: What is the information theory? 
 
     def crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
         """
