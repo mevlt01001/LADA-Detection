@@ -12,14 +12,16 @@ from ultralytics.models.rtdetr import RTDETR
 from ultralytics.nn.modules import Detect, RTDETRDecoder, Concat
 from ultralytics.nn.modules.conv import Conv, DWConv
    
-class FPN(torch.nn.Module):
+class Body(torch.nn.Module):
     """
     This class extracts features pyramid (FPN) (p3, p4, p5) output from given model as a backbone (ultralytics.nn.tasks.DetectionModel).
     """
     def __init__(self, model: UltrlyticsModel, device=torch.device("cpu")):
         assert isinstance(model, UltrlyticsModel), f"model should be instance of ultralytics.engine.model.Model"
         assert model.task == "detect", f"An error occurred in {model.model_name}. Only 'detect' task are supported, not {model.task} task yet."
-        super(FPN, self).__init__()
+
+        super(Body, self).__init__()
+        
         self.model = model
         self.f = model.model.model[-1].f # list of feature map layer indices [..., p3, p4, p5, ...]
         self.layers = model.to(device).model.model
@@ -36,7 +38,7 @@ class FPN(torch.nn.Module):
             outputs.append(x)
         raise ValueError(f"An error occurred in {self.model.model_name}. Detect/RTDETRDecoder layer not found.")
 
-class HybridNet(torch.nn.Module):
+class HybridBody(torch.nn.Module):
     """
     This class concatenates features pyramid (FPN) (p3, p4, p5) output from given models as a backbone (ultralytics.nn.tasks.DetectionModel).
     
@@ -46,10 +48,10 @@ class HybridNet(torch.nn.Module):
         device (torch.device): torch device
     """
     def __init__(self, models: list[UltrlyticsModel], imgsz:int, device=torch.device("cpu")):
-        super(HybridNet, self).__init__()
-        self.models = [FPN(model, device) for model in models]
+        super(HybridBody, self).__init__()
+        self.models = [Body(model, device) for model in models]
         assert all([len(model.f) == len(self.models[0].f) for model in self.models]),\
-            f"{[model.f for model in self.models]} should be same length."
+            f"Detect Layers inputs ({[model.f for model in self.models]}) should be same length."
         self.f_lenght = len(self.models[0].f)
         with torch.no_grad():
             dummy = torch.randn(1, 3, imgsz, imgsz, device=device)
@@ -87,8 +89,8 @@ class Head(nn.Module):
 
     Args:
         nc (int): number of classes
-        in_ch (int): number of input channels
-        regmax (int): maximum number of anchors
+        in_ch (list[int]): input channels
+        regmax (int): maximum number of prob bins
         device (torch.device): device
 
     Methods:
@@ -177,7 +179,7 @@ class Preprocess(nn.Module):
 
 class Model(nn.Module):
     """
-    This class is a combination of `HybridNet` and `Head` classes.\\
+    This class is a combination of `HybridBody` and `Head` classes.\\
     It provides **DFL-Based** and **anchor-free** regression and classification layers which is like YOLOv11
 
     Args:
@@ -193,10 +195,10 @@ class Model(nn.Module):
     def __init__(self, models: list[UltrlyticsModel], nc=80, regmax=None, imgsz=640, device=torch.device("cpu")):
         super().__init__()
         self.imgsz = max(64, 32*(imgsz//32))
-        self.preprocess = Preprocess(imgsz=self.imgsz)
-        self.body = HybridNet(models=models, device=device, imgsz=self.imgsz)
+        self.preprocess = Preprocess(imgsz=self.imgsz).to(device)
+        self.body = HybridBody(models=models, device=device, imgsz=self.imgsz)
         self.nc = nc
-        self.regmax = imgsz//int(np.median(self.body.strides))//2 if regmax is None else regmax
+        self.regmax = self.imgsz//int(np.median(self.body.strides))//2 if regmax is None else regmax
         self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.body.out_ch, device=device)
     
     def forward(self, x):
@@ -212,7 +214,6 @@ class ModelTrainer:
 
     Args:
         model (Model): HybridNet and Head models which are processed ultralytics models
-
     Methods:
         crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]): creates targets
     """
@@ -274,14 +275,14 @@ class ModelTrainer:
         """
         c1_assignments = self.create_c1_targets(gt_boxes, preds) # EPCP areas anchor points assignment for each stride
         c2_assignments = self.create_c2_targets(c1_assignments) # EPCP areas best 9 anchor points assignment for each stride
-        c3_assignments, avg_loss = self.create_c3_targets(c2_assignments) # Total best 20 anchor points assignment and average its losses
-        final_assignments = defaultdict(list) # it will use to apply DLT
+        c3_assignments, avg_loss = self.create_c3_targets(c2_assignments) # Total best 20 anchor points assignment and average of its losses
+        final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
         
         for (st, (j, i), (cx, cy)), (box, loss) in c3_assignments.items():
             if loss < avg_loss: # Dynamic Loss Threshold(DLT)
                 final_assignments[(st, (j, i), (cx, cy))].append((box, loss))
         
-        labels = [torch.zeros((1, 4*self.regmax+self.nc, self.imgsz//st, self.imgsz//st), device=self.model.device) for st in self.strides] # labels for each stride
+        labels = [torch.zeros((1, 4*self.regmax+self.nc, self.imgsz//st, self.imgsz//st), device=self.device) for st in self.strides] # labels for each stride
         
         for lb in labels:
             for (st, (j, i), (cx, cy)), (gt_box, loss) in final_assignments.items():
@@ -361,16 +362,17 @@ class ModelTrainer:
         # preds = [[1,4*regmax+nc,p3,p3],[1,4*regmax+nc,p4,p4],[1,4*regmax+nc,p5,p5]]
 
         assignments = defaultdict(list) # [st, grid_point, normalized_point, [gt, loss]]
-        r = lambda s: np.sqrt((s*(1/max(self.strides))))
+        r = lambda s: np.sqrt((s*(1/max(self.strides)))) # EPCP scale factor. All anchors are positive for max(self.strides), other strides include same anchor points count.
         positive_areas = lambda s, gt:\
-                            ModelTrainer.cxcywh2xyxy(
-                                torch.tensor([gt[0], gt[1], gt[2]*r(s), gt[3]*r(s)])
+                            torchvision.ops.box_convert(
+                                torch.tensor([[gt[1], gt[2], gt[3]*r(s), gt[4]*r(s)]]),
+                                'xyxy', 'cxcywh'
                             ) # EPCP
         
         # Grid assignment
         for st in self.strides:
             for box in gt_boxes:
-                pa = positive_areas(st, box) # GT Box positive area xyxy
+                pa = positive_areas(st, box) # GT Box positive area xyxy, PA cxcywh
                 for j in range(self.imgsz//st):
                     for i in range(self.imgsz//st):
                         cx = (i+0.5)*st/self.imgsz
@@ -379,19 +381,18 @@ class ModelTrainer:
                             assignments[(st, (j, i), (cx, cy))].append((box, -1)) # Assign to grid cell
 
             # Multiple Assignment Handling
-            for (stride_and_loc, boxes) in assignments.items():
+            for (st, (j, i), (cx, cy)) , boxes in assignments.items():
                 if len(boxes) > 1: # Multiple assignment
-                    cx, cy = stride_and_loc[2]
                     best_box = None
                     best_dist = float('inf')
                     for box,loss in boxes:
-                        bcx = box[0]
-                        bcy = box[1]
+                        bcx = box[1]
+                        bcy = box[2]
                         dist = (bcx - cx)**2 + (bcy - cy)**2
                         if dist < best_dist:
                             best_dist = dist
                             best_box = box
-                    assignments[stride_and_loc] = [(best_box, -1)]
+                    assignments[(st, (j, i), (cx, cy))] = [(best_box, -1)]
 
         # Loss Calculation for preds tensor
         for pred in preds:
@@ -446,9 +447,14 @@ class ModelTrainer:
 
         pred_reg = pred[:self.regmax*4].view(self.regmax, 4).softmax(dim=0)
         proj = torch.arange(0, self.regmax).view(-1,1).float().to(pred.device)
-        ltrb = torch.sum(pred_reg*proj, dim=0)
-        xyxy_pred = torchvision.ops.box_convert(ltrb, 'ltrb', 'xyxy')*stride/self.imgsz
-        xyxy_gt = torchvision.ops.box_convert(gt[1:], 'ltrb', 'xyxy')
+        ltrb = torch.sum(pred_reg*proj, dim=0)*stride/self.imgsz
+        xyxy_pred = torch.tensor([
+            anchor_point[0]-ltrb[0], 
+            anchor_point[1]-ltrb[1], 
+            anchor_point[0]+ltrb[2], 
+            anchor_point[1]+ltrb[3]], 
+            device=ltrb.device)
+        xyxy_gt = torchvision.ops.box_convert(gt[1:], 'cxycwh', 'xyxy')[0]
 
         Lreg = torchvision.ops.ciou_loss.complete_box_iou_loss(xyxy_pred, xyxy_gt)
         Lcls = torchvision.ops.focal_loss.sigmoid_focal_loss(pred_classes, gt_classes, alpha=0.25, gamma=2)
@@ -495,7 +501,7 @@ class ModelTrainer:
 model1 = YOLO("pt_folder/yolo12l.pt")
 model2 = RTDETR("pt_folder/rtdetr-l.pt")
 
-model = Model(models=[model1, model2], nc=5, regmax=None, imgsz=32*16, device=torch.device("cuda"))
+model = Model(models=[model1, model2], nc=5, regmax=None, imgsz=32*20, device=torch.device("cuda"))
 dummy = torch.randint(0, 255, (334,553, 3), dtype=torch.uint8, device=torch.device("cuda"))
 print(model.body.strides)
 print(model.regmax)
