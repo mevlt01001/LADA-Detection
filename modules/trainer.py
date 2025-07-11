@@ -1,213 +1,14 @@
-import os, json
-import cv2, onnx, onnxsim
+# LADA Assignment Algorithm https://doi.org/10.3390/s23146306
+# Training loss is different from paper
+# Training Loss = λ1*Focal Loss + λ2*CIoU Loss + λ3*DFL | λ1:0.5, λ2:1.5, λ3:7.5
+
+import torch
+import torchvision
 import numpy as np
-import torch.nn as nn
-import torch, torchvision
-import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from modules import Model
 from collections import defaultdict
-from ultralytics.engine.model import Model as UltrlyticsModel
-from ultralytics.models.yolo import YOLO
-from ultralytics.models.rtdetr import RTDETR
-from ultralytics.nn.modules import Detect, RTDETRDecoder, Concat
-from ultralytics.nn.modules.conv import Conv, DWConv
-   
-class Body(torch.nn.Module):
-    """
-    This class extracts features pyramid (FPN) (p3, p4, p5) output from given model as a backbone (ultralytics.nn.tasks.DetectionModel).
-    """
-    def __init__(self, model: UltrlyticsModel, device=torch.device("cpu")):
-        assert isinstance(model, UltrlyticsModel), f"model should be instance of ultralytics.engine.model.Model"
-        assert model.task == "detect", f"An error occurred in {model.model_name}. Only 'detect' task are supported, not {model.task} task yet."
 
-        super(Body, self).__init__()
-        
-        self.model = model
-        self.f = model.model.model[-1].f # list of feature map layer indices [..., p3, p4, p5, ...]
-        self.layers = model.to(device).model.model
-    
-    def forward(self, x):
-        outputs = []
-        for m in self.layers:
-            if isinstance(m, (Detect, RTDETRDecoder)):
-                return [outputs[f] for f in self.f]
-            elif isinstance(m, Concat):
-                x = m([outputs[f] for f in m.f])
-            else:
-                x = m(x) if m.f == -1 else m(outputs[m.f])
-            outputs.append(x)
-        raise ValueError(f"An error occurred in {self.model.model_name}. Detect/RTDETRDecoder layer not found.")
-
-class HybridBody(torch.nn.Module):
-    """
-    This class concatenates features pyramid (FPN) (p3, p4, p5) output from given models as a backbone (ultralytics.nn.tasks.DetectionModel).
-    
-    Args:
-        models (list[ultralytics.engine.model.Model]): list of ultralytics.engine.model.Model with 'detect' task
-        imgsz (int): model input image size. Models accpets min(64, 32k) {k ∈ Natural numbers}-{0}
-        device (torch.device): torch device
-    """
-    def __init__(self, models: list[UltrlyticsModel], imgsz:int, device=torch.device("cpu")):
-        super(HybridBody, self).__init__()
-        self.models = [Body(model, device) for model in models]
-        assert all([len(model.f) == len(self.models[0].f) for model in self.models]),\
-            f"Detect Layers inputs ({[model.f for model in self.models]}) should be same length."
-        self.f_lenght = len(self.models[0].f)
-        with torch.no_grad():
-            dummy = torch.randn(1, 3, imgsz, imgsz, device=device)
-            out = self.forward(dummy)
-            self.out_ch = [p.shape[1] for p in out]
-            self.strides = [imgsz // f.shape[-1] for f in out]
-        del dummy, out
-
-    def forward(self, x):
-        """
-        Concatenates feature maps output from given models and returns list of feature maps
-
-        Args:
-            x (torch.Tensor): input image tensor shaped like (B, C, H, W) or (1,3,640,640)
-
-        Returns:
-            list[torch.Tensor]: list of feature maps
-        """
-        _outputs = []
-        for model in self.models:
-            out = model.forward(x) # [[1,ch1,80k,80k],[1,ch2,40k,40k],...,[1,chn,20k,20k]]
-            _outputs.append(out)
-        
-        outputs = []
-        for feat_idx in range(len(_outputs[0])):
-            outputs.append(
-                # [1,ch1+ch2+...+chn,80k,80k]
-                torch.cat([out[feat_idx] for out in _outputs], dim=1)
-            )
-        return outputs # [[1,ch1+ch2+...+chn,80,80], [1,ch1+ch2+...+chn,40,40], ...]
-    
-class Head(nn.Module):
-    """
-    This class provides **DFL-Based** and **anchor-free** regression and classification layers which is like YOLOv11
-
-    Args:
-        nc (int): number of classes
-        in_ch (list[int]): input channels
-        regmax (int): maximum number of prob bins
-        device (torch.device): device
-
-    Methods:
-        forward(self, x): accepts feature pyramid output (..., p3, p4, p5, ...) and returns DFL-Based regression and classification outputs for feature maps.
-    """
-    def __init__(self, nc, in_ch, regmax=16, device=torch.device("cpu")):
-        super().__init__()
-        reg_inter_ch = lambda ch: max((ch // 4, regmax * 4))
-        cls_inter_ch = max((min(in_ch)//4, nc))
-        self.reg_blocks = nn.ModuleList(
-            nn.Sequential(
-                Conv(ch, reg_inter_ch(ch), 3),
-                Conv(reg_inter_ch(ch), reg_inter_ch(ch), 3),
-                Conv(reg_inter_ch(ch), reg_inter_ch(ch), 3),
-                nn.Conv2d(reg_inter_ch(ch), 4 * regmax, 1),
-            )for ch in in_ch
-        ).to(device)
-        self.cls_blocks = nn.ModuleList(
-            nn.Sequential(
-                nn.Sequential(DWConv(ch, ch, 3), Conv(ch, cls_inter_ch, 1)),
-                nn.Sequential(DWConv(cls_inter_ch, cls_inter_ch, 3), Conv(cls_inter_ch, cls_inter_ch, 1)),
-                nn.Conv2d(cls_inter_ch, nc, 1),
-            )for ch in in_ch
-        ).to(device)
-
-    def forward(self, x):
-        """
-        Args:
-            x (list[torch.Tensor]): `HybridNet` feature pyramid output (..., p3, p4, p5, ...)
-
-        Returns:
-            outputs (list[torch.Tensor]):
-            DFL-Based regression and classification outputs for each feature pyramid output.\\
-            The shape of each output is (B, 4*regmax+nc, h, w)
-        """
-        # x = [[1,ch1+ch2+...+chn,80k,80k],[1,ch1+ch2+...+chn,40k,40k],[1,ch1+ch2+...+chn,20k,20k]]
-        outputs = []
-        for idx, x in enumerate(x):
-            reg = self.reg_blocks[idx](x) #            [[1,4*regmax,H,W]
-            cls = self.cls_blocks[idx](x) #            [[1,nc,H,W]
-            outputs.append(torch.cat((reg, cls), 1)) # [[1,4*regmax+nc,H,W]
-        return outputs # [[1,4*regmax+nc,80k,80k],[1,4*regmax+nc,40k,40k],[1,4*regmax+nc,20k,20k]]
-
-class Preprocess(nn.Module):
-    """
-    This class is used to below1 input process for models.
-    Args:
-        imgsz (int): Model input image(H,W) size
-
-    ### Image init parameters:
-    - type: uint8
-    - shape: (H, W, 3)
-    - range: [0, 255]
-    - format: BGR
-    ### Models accepted parameters:
-    - type: float32
-    - shape: (B, 3, imgsz, imgsz)
-    - range: [0.0, 1.0]
-    - format: RGB
-    
-    Models accpets min(64, 32k) {k ∈ Natural numbers}
-
-    """
-    def __init__(self, imgsz=640):
-        super().__init__()
-        self.imgsz = imgsz
-    def forward(self, x: torch.Tensor):
-        # type conversion: uint8 -> float
-        x = x.to(torch.float32)
-        # BGR to RGB
-        print(x.shape)
-        x = torch.cat(
-            [
-                x[:, :, 2:],
-                x[:, :, 1:2],
-                x[:, :, 0:1],
-            ],
-            dim=-1
-        )
-        print(x.shape)
-        # shape conversion: (H,W,3) -> (1,3,imgsz,imgsz)/255.0
-        x = x.permute(2, 0, 1).unsqueeze(0) # [H,W,3] -> [1,3,H,W]
-        x = F.interpolate(x, size=(self.imgsz, self.imgsz), mode="bilinear")
-        x = x*(1.0/255.0)
-        return x
-
-class Model(nn.Module):
-    """
-    This class is a combination of `HybridBody` and `Head` classes.\\
-    It provides **DFL-Based** and **anchor-free** regression and classification layers which is like YOLOv11
-
-    Args:
-        models (list[UltrlyticsModel]): list of ultralytics models
-        nc (int): number of classes
-        regmax (int, None): maximum number of bbox distrubution bins. if None, set to `imgsz//int(np.median(self.body.strides))//2`
-        imgsz (int): input image size
-        device (torch.device): device
-
-    Methods:
-        forward(self, x): accepts input image tensor shaped like (H, W, C) and returns DFL-Based regression and classification outputs for feature maps.
-    """
-    def __init__(self, models: list[UltrlyticsModel], nc=80, regmax=None, imgsz=640, device=torch.device("cpu")):
-        super().__init__()
-        self.imgsz = max(64, 32*(imgsz//32))
-        self.preprocess = Preprocess(imgsz=self.imgsz).to(device)
-        self.body = HybridBody(models=models, device=device, imgsz=self.imgsz)
-        self.nc = nc
-        self.regmax = self.imgsz//int(np.median(self.body.strides))//2 if regmax is None else regmax
-        self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.body.out_ch, device=device)
-    
-    def forward(self, x):
-        x = self.preprocess(x)
-        x = self.body(x)
-        x = self.head(x)
-        return x
-   
-class ModelTrainer:
+class Trainer:
     """
     This class is a trainer for `Model` class.\\
     It provides to train `Model` class with Lightweight Anchor Dynamic Assignment (LADA) Algorithm https://doi.org/10.3390/s23146306\\
@@ -229,35 +30,10 @@ class ModelTrainer:
         self.train_ann_data = None
         self.val_ann_data = None
         
-    def __load_json_data(self, ann_json_path:os.PathLike, trainval:bool=False):
-        with open(ann_json_path, "r") as f:
-            return json.load(f)
-
-    def __prep_names(data:dict):
-        data = data["images"]
-        ann = data["annotations"]
-        names = [[os.path.splitext(data[i]["file_name"]), data[i]["id"]] for i in range(len(data))]
-        return names
-    
-    def __get_bbox_with_id(data:list, id:int):
-        # data = json["annotations"]
+    def DFL_decode(self, pred:list[torch.Tensor]):
+        # pred: list of tensors shaped like [1,4*regmax+nc,H,W]
+        # TODO: returns default dict, keys are (stride, (row, col)) and value is (cx, cy, w, h) normalized 0-1
         pass
-
-    def calc_loss(self, preds:list[torch.Tensor], targets: list[torch.Tensor]):
-        # TODO: calc loss with DFL + Focal Loss + CIoULoss for each stride
-        # preds = [[1,4*regmax+nc,p3,p3],...,[1,4*regmax+nc,p5,p5]]
-        # Targets = [[1,4*regmax+nc,p3,p3],...,[1,4*regmax+nc,p5,p5]]
-        
-        # calc DFL
-        DistPreds = [pred[0, :4*self.regmax].reshape(4, self.regmax, pred.shape[-1], pred.shape[-1]).softmax(dim=1) for pred in preds]
-        DistTargets = [target[0, :4*self.regmax].reshape(4, self.regmax, target.shape[-1], target.shape[-1]) for target in targets]
-        DFL = 0
-        for pred in DistPreds:
-            for target in DistTargets:
-                if pred.shape == target.shape:
-                    pass
-                pass
-        # TODO: What is the information theory? 
 
     def crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
         """
@@ -497,13 +273,3 @@ class ModelTrainer:
             return label
         
         return torch.cat([dist(l), dist(t), dist(r), dist(b)], dim=0)
-
-model1 = YOLO("pt_folder/yolo12l.pt")
-model2 = RTDETR("pt_folder/rtdetr-l.pt")
-
-model = Model(models=[model1, model2], nc=5, regmax=None, imgsz=32*20, device=torch.device("cuda"))
-dummy = torch.randint(0, 255, (334,553, 3), dtype=torch.uint8, device=torch.device("cuda"))
-print(model.body.strides)
-print(model.regmax)
-out = model(dummy)
-print([p.shape for p in out])

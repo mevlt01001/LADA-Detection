@@ -8,3 +8,4 @@ __pycache__/
 *.jpg*
 *.jpeg*
 average_precision/
+*.pdf
