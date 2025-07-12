@@ -32,7 +32,7 @@ class Trainer:
         
     def DFL_decode(self, pred:list[torch.Tensor]):
         # pred: list of tensors shaped like [1,4*regmax+nc,H,W]
-        # TODO: returns default dict, keys are (stride, (row, col)) and value is (cx, cy, w, h) normalized 0-1
+        # TODO: returns default dict, keys are (stride, (row, col)) and value is (cx, cy, w, h, one_hot_cls) normalized 0-1
         pass
 
     def crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
