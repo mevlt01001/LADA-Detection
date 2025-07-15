@@ -9,3 +9,4 @@ __pycache__/
 *.jpeg*
 average_precision/
 *.pdf
+train_head.py
