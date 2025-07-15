@@ -7,5 +7,6 @@ from ultralytics.nn.modules import Detect, RTDETRDecoder, Concat
 from .preprocess import Preprocess
 from .body import Body, HybridBody
 from .detection_head import Head
+from .dfl_layer import DFL
 from .model import Model
 from .trainer import Trainer

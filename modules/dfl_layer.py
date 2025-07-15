@@ -2,12 +2,12 @@
 import torch
 
 class DFL(torch.nn.Module):
-    def __init__(self, reg_max, nc, imgsz):
+    def __init__(self, regmax, nc, imgsz):
         super(DFL, self).__init__()
-        self.reg_max = reg_max #
+        self.regmax = regmax #
         self.nc = nc
         self.imgsz = imgsz # 
-        self.proj = torch.arange(1,reg_max+1, dtype=torch.float32).view(1,1, reg_max, 1, 1)
+        self.proj = torch.arange(1,regmax+1, dtype=torch.float32).view(1,1, regmax, 1, 1)
 
     def forward(self, x:list[torch.Tensor]):
         # x = [[1,4*regmax+nc,8k,8k], [1,4*regmax+nc,4k,4k], [1,4*regmax+nc,2k,2k], ...]
@@ -17,8 +17,8 @@ class DFL(torch.nn.Module):
             B, C, H, W = pred.shape
             st = self.imgsz//H
 
-            reg = pred[:, :4*self.reg_max, ...].view(B, 4, self.reg_max, H, W) # [B,4,regmax,H,W]
-            cls = pred[:, 4*self.reg_max:, ...] # [B,nc,H,W]
+            reg = pred[:, :4*self.regmax, ...].view(B, 4, self.regmax, H, W) # [B,4,regmax,H,W]
+            cls = pred[:, 4*self.regmax:, ...] # [B,nc,H,W]
 
             cls = cls.softmax(1) # Get Class Probabilities Distribution
             
