@@ -1,6 +1,8 @@
+"""
 # LADA Assignment Algorithm https://doi.org/10.3390/s23146306
 # Training loss is different from paper
-# Training Loss = λ1*Focal Loss + λ2*CIoU Loss + λ3*DFL | λ1:0.5, λ2:1.5, λ3:7.5
+## Training Loss = λ1*Focal Loss + λ2*CIoU Loss + λ3*DFL | λ1:0.5, λ2:1.5, λ3:7.5
+"""
 
 import torch
 import torchvision
@@ -32,7 +34,7 @@ class Trainer:
         
     def DFL_decode(self, pred:list[torch.Tensor]):
         # pred: list of tensors shaped like [1,4*regmax+nc,H,W]
-        # TODO: returns default dict, keys are (stride, (row, col)) and value is (cx, cy, w, h, one_hot_cls) normalized 0-1
+        # TODO: returns default dict, keys are (stride, (row, col)) and value is (x1,y1,x2,y2, one_hot_cls) normalized 0-1
         pass
 
     def crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):

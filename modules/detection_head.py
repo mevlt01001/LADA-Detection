@@ -13,7 +13,7 @@ class Head(torch.nn.Module):
     Methods:
         forward(self, x): accepts feature pyramid output (..., p3, p4, p5, ...) and returns DFL-Based regression and classification outputs for feature maps.
     """
-    def __init__(self, nc, in_ch, regmax, device=torch.device("cpu")):
+    def __init__(self, nc, in_ch, regmax, device:torch.device="cpu"):
         super().__init__()
         reg_inter_ch = lambda ch: max((ch // 4, regmax * 4))
         cls_inter_ch = max((min(in_ch)//4, nc))

@@ -4,10 +4,10 @@ import torch
 class DFL(torch.nn.Module):
     def __init__(self, regmax, nc, imgsz):
         super(DFL, self).__init__()
-        self.regmax = regmax #
+        self.regmax = regmax
         self.nc = nc
-        self.imgsz = imgsz # 
-        self.proj = torch.arange(1,regmax+1, dtype=torch.float32).view(1,1, regmax, 1, 1)
+        self.imgsz = imgsz
+        self.proj = torch.arange(1,regmax+1, dtype=torch.float32).view(1, 1, regmax, 1, 1)
 
     def forward(self, x:list[torch.Tensor]):
         # x = [[1,4*regmax+nc,8k,8k], [1,4*regmax+nc,4k,4k], [1,4*regmax+nc,2k,2k], ...]
@@ -23,7 +23,7 @@ class DFL(torch.nn.Module):
             cls = cls.softmax(1) # Get Class Probabilities Distribution
             
             reg = reg.softmax(2) # Get LTRB Regression Probabilities (for regmax) Distribution
-            reg = (reg * self.proj.to(pred.device)).sum(2, keepdim=False)*st/self.imgsz # [B,4,H,W] Get LTRB Regression distance presented hom much stride distanca to pixel, normalized 0-1.
+            reg = (reg * self.proj.to(pred.device)).sum(2, keepdim=False)*st # [B,4,H,W] Get LTRB Regression distance presented hom much stride distanca to pixel, normalized 0-imgsz.
             
             gcx, gcy = torch.meshgrid(torch.arange(W, device=pred.device), torch.arange(H, device=pred.device), indexing='xy')
             gcx = gcx.view(1, H, W).expand(B, H, W).float() # [B,H,W]

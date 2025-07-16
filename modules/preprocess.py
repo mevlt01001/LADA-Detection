@@ -24,6 +24,7 @@ class Preprocess(torch.nn.Module):
     def __init__(self, imgsz=640):
         super().__init__()
         self.imgsz = imgsz
+        
     def forward(self, x: torch.Tensor):
         # type conversion: uint8 -> float
         x = x.to(torch.float32)
