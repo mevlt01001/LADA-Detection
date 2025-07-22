@@ -25,7 +25,7 @@ class DFL(torch.nn.Module):
         self.imgsz = imgsz
         self.grid_sizes = grid_sizes
         self.split = onnx_nms_out
-        self.proj = torch.arange(1,regmax+1, dtype=torch.float32, device=device).view(1, 1, regmax, 1)
+        self.proj = torch.arange(0,regmax, dtype=torch.float32, device=device).view(1, 1, regmax, 1)
         strides = []
         for gs in self.grid_sizes:
             st, repeat = self.imgsz//gs, gs**2            
@@ -76,13 +76,13 @@ class DFL(torch.nn.Module):
         cls = cls.sigmoid()
         reg = reg.reshape(B, 4, self.regmax, reg.shape[-1]).softmax(2) # [B,4,regmax,N], softmaxed regmax channel
         # reg = self.conv(reg).squeeze(2) slower way
-        reg = (reg*self.proj).sum(2)*self.strides
+        reg = (reg*self.proj).sum(2)*self.strides+1
         # convert ltrb to xyxy
         l,t,r,b = torch.split(reg, [1,1,1,1], dim=1)
-        x1 = gx - l # [B,1,N]
-        y1 = gy - t # [B,1,N]
-        x2 = gx + r # [B,1,N]
-        y2 = gy + b # [B,1,N]
+        x1 = gx - l
+        y1 = gy - t
+        x2 = gx + r
+        y2 = gy + b
         scores = cls # [B,nc,N]
         xyxy = torch.cat([x1,y1,x2,y2], dim=1).permute(0,2,1) # [B,4,N]
         yxyx = torch.cat([y1,x1,y2,x2], dim=1).permute(0,2,1) # [B,4,N]

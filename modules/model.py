@@ -28,10 +28,10 @@ class Model(torch.nn.Module):
         self.regmax = regmax
         self.device = device
         self.preprocess = Preprocess(imgsz=self.imgsz) if preprocess else None
-        self.postprocess = Postprocess() if postprocess else None
         self.backbone = self._load_hybrid_backbone(models) # HybridBackbone, Body
         self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.backbone.out_ch, device=device)
         self.dfl = DFL(regmax=self.regmax, nc=nc, imgsz=self.imgsz, device=device, grid_sizes=self.backbone.grid_sizes) if dfl else None
+        self.postprocess = Postprocess() if postprocess else None
     
     def _load_hybrid_backbone(self, models: list[UltrlyticsModel]):
         available_tasks = ["detect"]
