@@ -10,3 +10,4 @@ __pycache__/
 average_precision/
 *.pdf
 train_head.py
+.vscode/

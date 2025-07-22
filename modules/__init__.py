@@ -9,6 +9,7 @@ from ultralytics.nn.modules.conv import Conv, DWConv
 from ultralytics.nn.modules import Detect, RTDETRDecoder, Concat
    
 from .preprocess import Preprocess
+from .postprocess import Postprocess
 from .body import Body, HybridBody
 from .detection_head import Head
 from .dfl_layer import DFL

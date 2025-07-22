@@ -1,51 +1,118 @@
-# in the next step, DFL will work one step. Now, this calculation spereted for each feature map
 import torch
 
 class DFL(torch.nn.Module):
-    def __init__(self, regmax, nc, imgsz):
+    """
+    This class process **DFL-Based** and **anchor-free** regression and classification layers outputs which is like YOLOv11
+
+    Args:
+        regmax (int): maximum number of prob bins
+        nc (int): number of classes
+        imgsz (int): input image size
+        grid_sizes (list[int]): the field of **`HybridBody`**
+        device (torch.device): device
+        onnx_nms_out (bool): whether to split regression and classification outputs (xyxy, yxyx, scores)
+
+    """
+    def __init__(self, regmax, nc, imgsz, 
+            grid_sizes: list[int], 
+            device=torch.device("cpu"),
+            onnx_nms_out=False
+            ):
+        
         super(DFL, self).__init__()
         self.regmax = regmax
         self.nc = nc
         self.imgsz = imgsz
-        self.proj = torch.arange(1,regmax+1, dtype=torch.float32).view(1, 1, regmax, 1, 1)
+        self.grid_sizes = grid_sizes
+        self.split = onnx_nms_out
+        self.proj = torch.arange(1,regmax+1, dtype=torch.float32, device=device).view(1, 1, regmax, 1)
+        strides = []
+        for gs in self.grid_sizes:
+            st, repeat = self.imgsz//gs, gs**2            
+            strides.extend([st]*repeat)
+        self.strides = torch.tensor(strides, device=device)
 
     def forward(self, x:list[torch.Tensor]):
+        """
+        Args:
+            x (list[torch.Tensor]): DFL-Based regression and classification outputs for each feature pyramid output.\\
+            The shape of each output is (B, 4*regmax+nc, h, w)
+
+        Returns:
+            outs (list[torch.Tensor]): DFL-Based regression and classification outputs for each feature pyramid output.\\
+            The shape of each output is (B, 4, h, w)
+
+        # Algorithm:
+            - Concatenate all outputs
+            - Split regression and classification outputs
+                - Regression Part:
+                    - Calculate centers for each feature pyramid output
+                    - Apply softmax to distrubuted regression (ltrb) outputs as regmax as far
+                    - Convert ltrb to xyxy
+                - Classification Part:
+                    - Apply sigmoid to classification outputs
+            - Concatenate regression and classification outputs
+        """
         # x = [[1,4*regmax+nc,8k,8k], [1,4*regmax+nc,4k,4k], [1,4*regmax+nc,2k,2k], ...]
-        outs = []
-        for pred in x:
-            # pred.shape is [1,4*regmax+nc,H,W]
-            B, C, H, W = pred.shape
-            st = self.imgsz//H
 
-            reg = pred[:, :4*self.regmax, ...].view(B, 4, self.regmax, H, W) # [B,4,regmax,H,W]
-            cls = pred[:, 4*self.regmax:, ...] # [B,nc,H,W]
+        centers = [
+            torch.meshgrid(torch.arange(gs), torch.arange(gs), indexing='xy')
+            for gs in self.grid_sizes
+        ]
 
-            cls = cls.softmax(1) # Get Class Probabilities Distribution
-            
-            reg = reg.softmax(2) # Get LTRB Regression Probabilities (for regmax) Distribution
-            reg = (reg * self.proj.to(pred.device)).sum(2, keepdim=False)*st # [B,4,H,W] Get LTRB Regression distance presented hom much stride distanca to pixel, normalized 0-imgsz.
-            
-            gcx, gcy = torch.meshgrid(torch.arange(W, device=pred.device), torch.arange(H, device=pred.device), indexing='xy')
-            gcx = gcx.view(1, H, W).expand(B, H, W).float() # [B,H,W]
-            gcy = gcy.view(1, H, W).expand(B, H, W).float() # [B,H,W]
-            gcx = (gcx+0.5)/st # grid center x points [0+(0.5/stride), 1-(0.5/stride)]
-            gcy = (gcy+0.5)/st # grid center y points [0+(0.5/stride), 1-(0.5/stride)]
-            
-            l = reg[:, 0, ...] # [B,H,W]
-            t = reg[:, 1, ...] # [B,H,W]
-            r = reg[:, 2, ...] # [B,H,W]
-            b = reg[:, 3, ...] # [B,H,W]
+        gx = [(c[0].float()+0.5).reshape(-1) for c in centers]
+        gy = [(c[1].float()+0.5).reshape(-1) for c in centers]
 
-            x1 = gcx - l
-            x2 = gcx + r
-            y1 = gcy - t
-            y2 = gcy + b
+        gx = torch.cat(gx, dim=0).to(x[0].device)*self.strides
+        gy = torch.cat(gy, dim=0).to(x[0].device)*self.strides
 
-            reg = torch.stack((x1, y1, x2, y2), 1) # [B,4,H,W]
-            out = torch.cat((reg, cls), 1) # [B,4+nc,H,W]
-            out = torch.reshape(out, (B, 4+self.nc, -1)) # [B,4*regmax+nc,H*W]
-            outs.append(out)
+        B, *_ = x[0].shape
 
-        out = torch.cat(outs, -1) # [B,4+nc,k*H*W]
+        # flat all outputs
+        x = [torch.reshape(x, (B, -1, x.shape[-1]**2)) for x in x]
+        # x = [[1,4*regmax+nc,8k*8k], [1,4*regmax+nc,4k*4k], [1,4*regmax+nc,2k*2k], ...]
+        combined = torch.cat(x, dim=-1)
+        reg, cls = torch.split(combined, [4*self.regmax, self.nc], dim=1)
+        cls = cls.sigmoid()
+        reg = reg.reshape(B, 4, self.regmax, reg.shape[-1]).softmax(2) # [B,4,regmax,N], softmaxed regmax channel
+        # reg = self.conv(reg).squeeze(2) slower way
+        reg = (reg*self.proj).sum(2)*self.strides
+        # convert ltrb to xyxy
+        l,t,r,b = torch.split(reg, [1,1,1,1], dim=1)
+        x1 = gx - l # [B,1,N]
+        y1 = gy - t # [B,1,N]
+        x2 = gx + r # [B,1,N]
+        y2 = gy + b # [B,1,N]
+        scores = cls # [B,nc,N]
+        xyxy = torch.cat([x1,y1,x2,y2], dim=1).permute(0,2,1) # [B,4,N]
+        yxyx = torch.cat([y1,x1,y2,x2], dim=1).permute(0,2,1) # [B,4,N]
+        out = (xyxy, yxyx, scores) if self.split else (torch.cat([x1,y1,x2,y2,scores], dim=1))
+
         return out
     
+# import onnx, onnxsim
+# regmax = 16
+# nc = 80
+# imgsz = 640
+# grid_sizes = [80,40,20]
+# device = torch.device("cuda")
+
+# dfl = DFL(regmax, nc, imgsz, grid_sizes, device, for_onnx_nms=True)
+# dummy1 = torch.rand(1, 4*16+80, 80, 80).to(torch.device("cuda"))
+# dummy2 = torch.rand(1, 4*16+80, 40, 40).to(torch.device("cuda"))
+# dummy3 = torch.rand(1, 4*16+80, 20, 20).to(torch.device("cuda"))
+
+# dummy = [dummy1, dummy2, dummy3]
+
+# torch.onnx.export(
+#     dfl,
+#     dummy,
+#     "dfl.onnx",
+#     export_params=True,
+#     opset_version=19
+# )
+
+# model = onnx.load("dfl.onnx")
+# model, check = onnxsim.simplify(model)
+# model = onnx.shape_inference.infer_shapes(model)
+# onnx.save(model, "dfl.onnx")

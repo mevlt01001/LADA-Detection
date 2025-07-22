@@ -10,7 +10,7 @@ class Body(torch.nn.Module):
         self.task = model.task
         self.detect_feats_from = model.model.model[-1].f # list of feature map layer indices [..., p3, p4, p5, ...]
         self.layers = torch.nn.ModuleList(model.to(device).model.model[:-1])
-        print(self.info())
+        # print(self.info())
     
     def forward(self, x):
         outputs = []
@@ -48,12 +48,20 @@ class HybridBody(torch.nn.Module):
         self.models = torch.nn.ModuleList(models)
         self.num_feats = len(self.models[0].detect_feats_from) # All models have same size of detect_feats_from
         self.imgsz = imgsz
+        train_states = {m: m.training for m in self.modules()}
+        self.eval()  # BN/Dropout güncellenmesin
+
         with torch.no_grad():
-            dummy = torch.randn(1, 3, imgsz, imgsz, device=device)
-            out = self.forward(dummy)
-            self.out_ch = [p.shape[1] for p in out]
-            self.strides = [imgsz // f.shape[-1] for f in out]
-        del dummy, out
+            dummy = torch.zeros(1, 3, imgsz, imgsz, device=device)  # zeros yeterli
+            out = self.forward(dummy)  # kendi forward'ını çağırma şekline dikkat
+
+        self.out_ch = [p.shape[1] for p in out]
+        self.strides = [imgsz // f.shape[-1] for f in out]
+        self.grid_sizes = [f.shape[-1] for f in out]
+
+        # 2) Modları geri yükle
+        for m, st in train_states.items():
+            m.train(st)
         self.regmax = self.imgsz//int(np.median(self.strides))//2 if regmax is None else regmax
 
     def forward(self, x):
