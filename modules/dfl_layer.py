@@ -76,7 +76,7 @@ class DFL(torch.nn.Module):
         cls = cls.sigmoid()
         reg = reg.reshape(B, 4, self.regmax, reg.shape[-1]).softmax(2) # [B,4,regmax,N], softmaxed regmax channel
         # reg = self.conv(reg).squeeze(2) slower way
-        reg = (reg*self.proj).sum(2)*self.strides+1
+        reg = (reg*self.proj).sum(2)*self.strides
         # convert ltrb to xyxy
         l,t,r,b = torch.split(reg, [1,1,1,1], dim=1)
         x1 = gx - l
@@ -84,9 +84,9 @@ class DFL(torch.nn.Module):
         x2 = gx + r
         y2 = gy + b
         scores = cls # [B,nc,N]
-        xyxy = torch.cat([x1,y1,x2,y2], dim=1).permute(0,2,1) # [B,4,N]
-        yxyx = torch.cat([y1,x1,y2,x2], dim=1).permute(0,2,1) # [B,4,N]
-        out = (xyxy, yxyx, scores) if self.split else (torch.cat([x1,y1,x2,y2,scores], dim=1))
+        xyxy = torch.cat([x1,y1,x2,y2], dim=1) # [B,4,N]
+        yxyx = torch.cat([y1,x1,y2,x2], dim=1) # [B,4,N]
+        out = (xyxy.permute(0,2,1), yxyx.permute(0,2,1), scores) if self.split else (torch.cat([xyxy,scores], dim=1))
 
         return out
     

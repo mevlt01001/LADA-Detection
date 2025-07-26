@@ -23,7 +23,7 @@ class Trainer:
     def __init__(self, model:Model, device=torch.device("cpu")):
 
         self.model = model
-        self.strides = model.body.strides
+        self.strides = model.backbone.strides
         self.imgsz = model.imgsz
         self.nc = model.nc
         self.regmax = model.regmax
@@ -31,18 +31,104 @@ class Trainer:
         self.root = None
         self.train_ann_data = None
         self.val_ann_data = None
+        self.proj = torch.arange(0, self.regmax, dtype=torch.float32, device=self.device).view(1, self.regmax, 1, 1)
         
-    def DFL_decode(self, pred:list[torch.Tensor]):
-        # pred: list of tensors shaped like [1,4*regmax+nc,H,W]
-        # TODO: returns default dict, keys are (stride, (row, col)) and value is (x1,y1,x2,y2, one_hot_cls) normalized 0-1
-        pass
+    def calc_loss(self,pred:list[torch.Tensor], 
+                  targets:list[torch.Tensor], 
+                  positive_anchors:list[torch.Tensor],                  
+                  ):
+        # Training wil generating in batch = 1
+        # gt: [N, 5] (cls_id, cx, cy, w, h)
+        # pred: [1, 4*regmax+nc, H, W]
+        # targets: [1, 4*regmax+nc, H, W]
+        # positive_anchors: [[H, W], ...]
+        # TODO: Implemente decode_preds func to get (cx, cy, w, h) for every anchor point
 
-    def crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
+        pred_reg = [p[0, :4*self.regmax, :, :] for p in pred] # [4*regmax, H, W]
+        truth_reg = [t[0, :4*self.regmax, :, :] for t in targets] # [4*regmax, H, W]
+        pred_cls = [p[0, 4*self.regmax:, :, :].reshape(self.nc, -1).T for p in pred] # [N, nc]
+        truth_cls = [t[0, 4*self.regmax:, :, :].reshape(self.nc, -1).T for t in targets] # [N, nc]
+
+        # Distributed Focal Loss
+        dfl_loss = 0
+        for p, t, pos in zip(pred_reg, truth_reg, positive_anchors): 
+            dfl_loss += self.calc_dfl(p, t, pos)
+
+        # Calc CIoU loss
+        ciou_loss = 0
+        for p, t, pos in zip(pred_reg, truth_reg, positive_anchors):
+            ciou_loss += self.calc_CIoU(p, t, pos)
+
+        # Calc Clasification Focal Loss
+        cls_loss = 0
+        for p, t in zip(pred_cls, truth_cls):
+            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')
+
+        w = [0.5, 1.5, 7.5]
+        loss = cls_loss*w[0] + ciou_loss*w[1] + dfl_loss*w[2]
+
+        return loss
+    
+    def calc_dfl(self, pred:torch.Tensor, target:torch.Tensor, positive_anchors:torch.Tensor):
+        # pred: [4*regmax,H,W]
+        # taget: [4*regmax,H,w]
+        
+        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
+        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
+
+        target = target.view(4, self.regmax, target.shape[-1]) # [4,regmax,N]
+        pred = pred.view(4, self.regmax, pred.shape[-1]) # [4,regmax,N]
+        pred = torch.log_softmax(pred, dim=1) # [4,regmax,N]
+        
+        loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')
+        return loss
+
+    def calc_CIoU(self, pred: torch.Tensor, target: torch.Tensor, positive_anchors: torch.Tensor):
+        # pred.shape = [4*regmax, H, W]
+        # target.shape = [4*regmax, H, W]
+        st = self.imgsz//pred.shape[-1]
+        gx,gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device), 
+                               torch.arange(pred.shape[-1], device=self.device), 
+                               indexing='xy')
+
+        gx = gx[positive_anchors[:, 0], positive_anchors[:, 1]] # [N]
+        gy = gy[positive_anchors[:, 0], positive_anchors[:, 1]] # [N]
+        gx = (gx.float()+0.5)*st 
+        gy = (gy.float()+0.5)*st
+        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
+        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
+
+        pred = pred.view(4, self.regmax, pred.shape[1]) # [4,regmax,N]
+        target = target.view(4, self.regmax, target.shape[1]) # [4,regmax,N]
+
+        pred = torch.softmax(pred, dim=1)
+        pred = (pred*self.proj).sum(1, keepdim=False)*st # [4,N]
+        target = (target*self.proj).sum(1, keepdim=False)*st # [4,N]
+
+        l,t,r,b = pred.split([1,1,1,1], dim=0) # [1,H,W]
+        x1 = gx - l
+        y1 = gy - t
+        x2 = gx + r
+        y2 = gy + b
+        pred_xyxy = torch.cat([x1,y1,x2,y2], dim=0).T # [4,N] -> [N,4]
+
+
+        l,t,r,b = target.split([1,1,1,1], dim=0) # [1,H,W]
+        x1 = gx - l
+        y1 = gy - t
+        x2 = gx + r
+        y2 = gy + b
+        target_xyxy = torch.cat([x1,y1,x2,y2], dim=0).T # [4,N] -> [N,4]
+
+        loss = torchvision.ops.complete_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')        
+        return loss
+
+    def create_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
         """
         Creates targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306\\
         This function is a combination of *create_c1_targets*, *create_c2_targets* and *create_c3_targets*\\
         Additionally, it applies **Dynamic Loss Threshold(DLT)** over *create_c3_targets* by using average loss\\
-        3.3. Dynamic Loss Threshold
+        https://doi.org/10.3390/s23146306 --> 3.3. Dynamic Loss Threshold
 
         Args:
             gt_boxes (torch.Tensor): ground truth boxes shaped like (n,5) (cls_id,cx,cy,w,h), normalized[0-1]
@@ -51,20 +137,27 @@ class Trainer:
         Returns:
             labels (list[torch.Tensor]): targets for each stride (...,p3,p4,p5,..)
         """
-        c1_assignments = self.create_c1_targets(gt_boxes, preds) # EPCP areas anchor points assignment for each stride
-        c2_assignments = self.create_c2_targets(c1_assignments) # EPCP areas best 9 anchor points assignment for each stride
-        c3_assignments, avg_loss = self.create_c3_targets(c2_assignments) # Total best 20 anchor points assignment and average of its losses
+        c1_assignments = self._c1_targets(gt_boxes, preds) # EPCP areas anchor points assignment for each stride
+        c2_assignments = self._c2_targets(c1_assignments) # EPCP areas best 9 anchor points assignment for each stride
+        c3_assignments, avg_loss = self._c3_targets(c2_assignments) # Total best 20 anchor points assignment and average of its losses
         final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
         
-        for (st, (j, i), (cx, cy)), (box, loss) in c3_assignments.items():
+        for (st, (j, i), (cx, cy)), [(box, loss)] in c3_assignments.items():
             if loss < avg_loss: # Dynamic Loss Threshold(DLT)
-                final_assignments[(st, (j, i), (cx, cy))].append((box, loss))
+                final_assignments[(st, (j, i))].append((cx, cy),(box, loss))
         
-        labels = [torch.zeros((1, 4*self.regmax+self.nc, self.imgsz//st, self.imgsz//st), device=self.device) for st in self.strides] # labels for each stride
+        labels = [
+            torch.zeros((1, 4*self.regmax+self.nc, self.imgsz//st, self.imgsz//st), device=self.device) 
+            for st in self.strides
+            ] # labels for each stride
         
+        positive_anchors = []
+
         for lb in labels:
-            for (st, (j, i), (cx, cy)), (gt_box, loss) in final_assignments.items():
+            pos = []
+            for (st, (j, i)), [(cx, cy), (gt_box, loss)] in final_assignments.items():
                 if st == lb.shape[2]*self.imgsz//st: # Check stride
+                    pos.append([i, j])
                     cls_label = torch.nn.functional.one_hot(gt_box[0].long(), self.nc)
                     x1, y1, x2, y2 = torchvision.ops.box_convert(gt_box[1:], 'cxcywh', 'xyxy')[0]
                     l = (cx - x1)*st
@@ -75,9 +168,11 @@ class Trainer:
                     label = torch.cat([ltrb_dist, cls_label], dim=0)
                     lb[0, :, j, i] = label
 
-        return labels
+            positive_anchors.append(torch.tensor(pos, dtype=torch.long, device=self.device))
 
-    def create_c3_targets(self, assignments: dict, k: int=20):
+        return labels, positive_anchors
+
+    def _c3_targets(self, assignments: dict, k: int=20):
         """
         Select best k anchor points from total c2_assignments
 
@@ -100,7 +195,7 @@ class Trainer:
 
         return c3_assignments, sum(losses)/len(losses)
 
-    def create_c2_targets(self, assignments: dict, k: int=9):
+    def _c2_targets(self, assignments: dict, k: int=9):
         """
         Select best k anchor points for each stride from c1_assignments
 
@@ -125,7 +220,7 @@ class Trainer:
 
         return c2_assignments
 
-    def create_c1_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
+    def _c1_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
         """
         Creates EPCP targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306 3.1. Equally Proportional Center Prior
 
