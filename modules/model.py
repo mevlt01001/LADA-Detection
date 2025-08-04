@@ -17,22 +17,21 @@ class Model(torch.nn.Module):
         forward(self, x): accepts input image tensor shaped like (H, W, C) and\
             returns DFL-Based regression and classification outputs for feature maps.
     """
-    def __init__(self, models: list[UltrlyticsModel], nc:int, imgsz:int, regmax:int=None, device=torch.device("cpu"),
-                preprocess:bool=False,
-                postprocess:bool=False,
-                dfl:bool=True
+    def __init__(self, 
+                 models: list[UltrlyticsModel], 
+                 nc:int, imgsz:int, regmax:int=None, 
+                 device=torch.device("cpu"),
                 ):
         super().__init__()
         self.imgsz = max(64, 32*(imgsz//32))
         self.nc = nc
         self.regmax = regmax
         self.device = device
-        self.preprocess = Preprocess(imgsz=self.imgsz) if preprocess else None
         self.backbone = self._load_hybrid_backbone(models) # HybridBackbone, Body
         self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.backbone.out_ch, device=device)
-        self.dfl = DFL(regmax=self.regmax, nc=nc, imgsz=self.imgsz, device=device, grid_sizes=self.backbone.grid_sizes) if dfl else None
-        self.postprocess = Postprocess() if postprocess else None
-    
+        self.dfl = DFL(regmax=self.regmax, nc=nc, imgsz=self.imgsz, device=device, grid_sizes=self.backbone.grid_sizes)        
+        self.postprocess = Postprocess()
+
     def _load_hybrid_backbone(self, models: list[UltrlyticsModel]):
         available_tasks = ["detect"]
 
@@ -56,18 +55,11 @@ class Model(torch.nn.Module):
         return hybrid_backbone
         
     def forward(self, x):
-        x = self.preprocess.forward(x) if self.preprocess is not None else x
         x = self.backbone.forward(x)
-        x = self.head.forward(x)
-        x = self.dfl.forward(x) if self.dfl is not None else x
-        x = self.postprocess.forward(x) if self.postprocess is not None else x
-        return x
+        fpn = self.head.forward(x)
+        x = self.dfl.forward(fpn)
+        x = self.postprocess.forward(x)
+        return x if not self.training else (x, fpn)
     
-    def train_forward(self, x, preprocess:bool=False, dfl:bool=False):
-        x = self.preprocess.forward(x) if preprocess else x
-        x = self.backbone.forward(x)
-        x = self.head.forward(x)
-        x = self.dfl.forward(x) if dfl else x
-        return x
 
    

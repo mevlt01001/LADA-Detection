@@ -13,7 +13,10 @@ class DFL(torch.nn.Module):
         onnx_nms_out (bool): whether to split regression and classification outputs (xyxy, yxyx, scores)
 
     """
-    def __init__(self, regmax, nc, imgsz, 
+    def __init__(self, 
+            regmax, 
+            nc, 
+            imgsz, 
             grid_sizes: list[int], 
             device=torch.device("cpu"),
             onnx_nms_out=False
@@ -39,8 +42,8 @@ class DFL(torch.nn.Module):
             The shape of each output is (B, 4*regmax+nc, h, w)
 
         Returns:
-            outs (list[torch.Tensor]): DFL-Based regression and classification outputs for each feature pyramid output.\\
-            The shape of each output is (B, 4, h, w)
+            output (torch.Tensor):
+            Concantenated regression and classification outputs (B, 4*regmax+nc, N)
 
         # Algorithm:
             - Concatenate all outputs
@@ -89,30 +92,3 @@ class DFL(torch.nn.Module):
         out = (xyxy.permute(0,2,1), yxyx.permute(0,2,1), scores) if self.split else (torch.cat([xyxy,scores], dim=1))
 
         return out
-    
-# import onnx, onnxsim
-# regmax = 16
-# nc = 80
-# imgsz = 640
-# grid_sizes = [80,40,20]
-# device = torch.device("cuda")
-
-# dfl = DFL(regmax, nc, imgsz, grid_sizes, device, for_onnx_nms=True)
-# dummy1 = torch.rand(1, 4*16+80, 80, 80).to(torch.device("cuda"))
-# dummy2 = torch.rand(1, 4*16+80, 40, 40).to(torch.device("cuda"))
-# dummy3 = torch.rand(1, 4*16+80, 20, 20).to(torch.device("cuda"))
-
-# dummy = [dummy1, dummy2, dummy3]
-
-# torch.onnx.export(
-#     dfl,
-#     dummy,
-#     "dfl.onnx",
-#     export_params=True,
-#     opset_version=19
-# )
-
-# model = onnx.load("dfl.onnx")
-# model, check = onnxsim.simplify(model)
-# model = onnx.shape_inference.infer_shapes(model)
-# onnx.save(model, "dfl.onnx")
