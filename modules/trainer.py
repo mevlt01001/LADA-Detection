@@ -57,9 +57,51 @@ class Trainer:
                 batch_size = batch if i+batch < len(train_names) else len(train_names)-i
                 optimizer.zero_grad()
                 images, gt_boxes = self.__load_data(train_names[i:batch_size+i], train_path)
+                img1 = np.ascontiguousarray((images[0].permute(1,2,0)*255).to("cpu").numpy().astype(np.uint8))
+                img2 = img1.copy()
+                img3 = img1.copy()
+                frame = np.zeros((img1.shape[0], img1.shape[1]*3, 3), dtype=np.uint8)
+
                 pred_boxes, preds = model.forward(images) # [[B,4*regmax+nc,p3,p3],[B,4*regmax+nc,p4,p4],[B,4*regmax+nc,p5,p5],...]
                 preds = [[p[idx] for p in preds] for idx in range(batch_size)]# [[[4*regmax+nc,p3,p3],[4*regmax+nc,p4,p4],[4*regmax+nc,p5,p5]], ...]
                 targets, pos = self.create_targets(gt_boxes, preds)
+
+                for idx, (pred, img) in enumerate(zip(preds[0], [img1, img2, img3])):
+                    # preds.shape = [4*regmax+nc, gs,gs]
+                    st = self.imgsz // pred.shape[-1]
+                    gx, gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device), torch.arange(pred.shape[-1], device=self.device), indexing='xy')
+                    gx = ((gx.float() + 0.5) * st).reshape(-1)
+                    gy = ((gy.float() + 0.5) * st).reshape(-1)
+                    
+                    reg = pred[:4*self.regmax].reshape(4, self.regmax,-1)
+                    cls = pred[4*self.regmax:].reshape(self.nc, -1)
+                    cls_scores, cls_ids = cls.max(0)
+                    mask = cls_scores > 0.0005
+
+                    reg = (reg.softmax(dim=1) * self.proj).sum(1)*st+1 # [4, N]
+
+                    l,t,r,b = torch.split(reg, [1,1,1,1], dim=0)
+                    x1 = gx - l
+                    y1 = gy - t
+                    x2 = gx + r
+                    y2 = gy + b
+
+                    _pred_boxes = torch.cat([x1,y1,x2,y2], dim=0).T.to(dtype=torch.int32, device="cpu")
+                    _pred_boxes = _pred_boxes[mask.to(device="cpu")].tolist()
+                    gx = gx[mask].to(dtype=torch.int32).tolist()
+                    gy = gy[mask].to(dtype=torch.int32).tolist()
+
+                    for box in _pred_boxes:
+                        cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (0,255,0), 1)
+                    
+                    for x, y in zip(gx, gy):
+                        cv2.circle(img, (x,y), 1, (0,0,255), 2)
+
+                    frame[:, idx*img.shape[1]:(idx+1)*img.shape[1]] = img
+                
+                cv2.imshow("frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
                 batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
                 self.map_metric.update(batch_pred_dicts, batch_target_dicts)
@@ -258,7 +300,7 @@ class Trainer:
         y2 = gy + b
         target_xyxy = torch.cat([x1,y1,x2,y2], dim=0).T # [4,N] -> [N,4]
 
-        loss = torchvision.ops.complete_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
+        loss = torchvision.ops.generalized_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
         return loss
 
     def create_targets(self, gt_boxes:list[torch.Tensor], preds:list[list[torch.Tensor]]):
@@ -293,7 +335,7 @@ class Trainer:
         c3_assignments, avg_loss = self.__candidate3(c2_assignments) # Total best 20 anchor points assignment and average of its losses
         final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
 
-        for (st, (j, i), (cx, cy)), [(box, loss)] in c3_assignments.items():
+        for (st, (j, i)), [(cx, cy), (box, loss)] in c3_assignments.items():
             if loss < avg_loss: # Dynamic Loss Threshold(DLT)
                 final_assignments[(st, (j, i))] = [(cx, cy),(box, loss)]
 
@@ -339,11 +381,11 @@ class Trainer:
         # assingnments = {st: {grid_point: [gt, loss]}}
         # calc select best k for each stride
         c3_assignments = defaultdict(list)
-        sorted_assignments = sorted(assignments.items(), key=lambda x: x[1][0][1])
+        sorted_assignments = sorted(assignments.items(), key=lambda x: x[1][1][1])
         k = min(k, len(sorted_assignments))
         losses = []
-        for (st, (j, i), (cx, cy)), [(box, loss)] in sorted_assignments[:k]:
-            c3_assignments[(st, (j, i), (cx, cy))].append((box, loss))
+        for (st, (j, i)), [(cx, cy), (box, loss)] in sorted_assignments[:k]:
+            c3_assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
             losses.append(loss)
         avg_loss = sum(losses)/len(losses) if len(losses) > 0 else 0
         return c3_assignments, avg_loss
@@ -363,13 +405,13 @@ class Trainer:
         c2_assignments = defaultdict(list)
         for st in self.strides:
             stride_groups = []
-            for (_st, (j, i), (cx, cy)), [(box, loss)] in assignments.items():
+            for (_st, (j, i)), [(cx, cy), (box, loss)] in assignments.items():
                 if _st == st:
                     stride_groups.append(((_st, (j, i), (cx, cy)), (box, loss)))
             sorted_stride_groups = sorted(stride_groups, key=lambda x: x[1][1])
             k = min(k, len(sorted_stride_groups))
             for (st, (j, i), (cx, cy)), (box, loss) in sorted_stride_groups[:k]: # 
-                c2_assignments[(st, (j, i), (cx, cy))].append((box, loss))
+                c2_assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
 
         return c2_assignments
 
@@ -421,14 +463,15 @@ class Trainer:
                     assignments[(st, (j, i), (cx, cy))] = [(best_box, -1)]
 
         # Loss Calculation for preds tensor
+        _assignments = defaultdict(list)
         for pred in preds:
             _st = self.imgsz//pred.shape[-1]
             for (st, (j, i), (cx, cy)), [(box, loss)] in assignments.items(): # Assingments'e atama yapılmıyor.
                 if st == _st:
                     loss = self.CLA(pred[:, i, j], box, (cx,cy), st)
-                    assignments[(st, (j, i), (cx, cy))] = [(box, loss)]
-
-        return assignments
+                    _assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
+        
+        return _assignments
        
     def CLA(self, pred:torch.Tensor, gt:torch.Tensor, anchor_point:tuple[int,int], stride:int):
         """
@@ -518,7 +561,7 @@ class Trainer:
         """
         # Distribute loss
         def dist(val:torch.Tensor):
-            v = torch.clamp(val, 0, self.regmax - 1 - 10e-3)
+            v = torch.clamp(val, 0, self.regmax-1-10e-4)
             left = int(torch.floor(v).item())
             right = left + 1
             label = torch.zeros(self.regmax, device=val.device)
@@ -530,26 +573,6 @@ class Trainer:
             return label
         
         return torch.cat([dist(l), dist(t), dist(r), dist(b)], dim=0)
-
-    def _decode_pred_batch(self, preds_boxes: list[torch.Tensor]):
-
-        batch_dicts = []
-       
-        for pred in preds_boxes:
-            # pred.shape is [N,6] xyxy, cls_score, cls_id
-            xyxy = pred[:, :4] # [N, 4]
-            _scores = pred[:, 4] # [N]
-            cls = pred[:, 5] # [N]
-
-            if xyxy.shape[0] == 0:
-                batch_dicts.append({"boxes": torch.zeros((0, 4), device=self.device),
-                                    "scores": torch.zeros((0,), device=self.device),
-                                    "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
-            else:
-                batch_dicts.append({"boxes": xyxy,
-                                    "scores": _scores,
-                                    "labels": cls.long()})
-        return batch_dicts
     
     def batch_eval(self, pred_boxes: list[torch.Tensor], gt_boxes:list[torch.Tensor]):
         # pred_boxes is [[N, 6],...] xyxy, cls_score, cls_id

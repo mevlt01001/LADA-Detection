@@ -58,6 +58,19 @@ class HybridBody(torch.nn.Module):
         self.grid_sizes = [f.shape[-1] for f in out]
 
         self.regmax = self.imgsz//int(np.median(self.strides))//2 if regmax is None else regmax
+        print(self)
+
+    def __str__(self):
+        return f"""
+        HybridBody:
+        models: {self.models}
+        num_feats: {self.num_feats}
+        imgsz: {self.imgsz}
+        out_ch: {self.out_ch}
+        strides: {self.strides}
+        grid_sizes: {self.grid_sizes}
+        regmax: {self.regmax}
+        """
 
     def forward(self, x):
         """
