@@ -96,7 +96,6 @@ class Trainer:
                 batch_stats = self.map_metric.compute()
                 map50 = batch_stats["map_50"].item()
                 map50_95 = batch_stats['map'].item()
-                self.map_metric.reset()
 
                 loss = self.calc_loss(batch_preds, targets, pos)
                 loss.backward()
@@ -139,10 +138,10 @@ class Trainer:
                 map50_95 = batch_stats['map'].item()
                 print(f" AvgLoss={sum(losses)/len(losses):<6.4f}\n\t"
                       f" Valid | mAP@50={map50*100:<6.3f} mAP@50:95={map50_95*100:<6.3f}\n")
-                self.map_metric.reset()
                 torch.cuda.empty_cache()
                 model = model.train(True)
-           
+            
+            self.map_metric.reset()
 
         model = model.train(mode=False)
         self.model = model
