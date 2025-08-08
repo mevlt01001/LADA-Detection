@@ -45,6 +45,7 @@ class HybridBody(torch.nn.Module):
     """
     def __init__(self, models: list[Body], imgsz:int, regmax:int=None, device=torch.device("cpu")):
         super(HybridBody, self).__init__()
+        self.model_names = [model.model_name for model in models]
         self.models = torch.nn.ModuleList(models)
         self.num_feats = len(self.models[0].detect_feats_from) # All models have same size of detect_feats_from
         self.imgsz = imgsz
@@ -63,7 +64,7 @@ class HybridBody(torch.nn.Module):
     def __str__(self):
         return f"""
         HybridBody:
-        models: {self.models}
+        models: {self.model_names}
         num_feats: {self.num_feats}
         imgsz: {self.imgsz}
         out_ch: {self.out_ch}

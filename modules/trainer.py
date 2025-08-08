@@ -43,65 +43,53 @@ class Trainer:
             class_metrics=False
             ).to(self.device)
 
-    def train(self, epoch:int, batch:int, train_path: str, valid_path: str=None):
+    def train(self, epoch:int, batch:int, train_path: str, valid_path: str=None, debug:bool=False):
 
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
         valid_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images"))))) if valid_path is not None else None
 
         model = self.model.train(True)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+        step = 0
         for ep in range(epoch):
             losses = []
 
             for i in range(0, len(train_names), batch):
                 batch_size = batch if i+batch < len(train_names) else len(train_names)-i
                 optimizer.zero_grad()
+
                 images, gt_boxes = self.__load_data(train_names[i:batch_size+i], train_path)
-                img1 = np.ascontiguousarray((images[0].permute(1,2,0)*255).to("cpu").numpy().astype(np.uint8))
-                img2 = img1.copy()
-                img3 = img1.copy()
-                frame = np.zeros((img1.shape[0], img1.shape[1]*3, 3), dtype=np.uint8)
-
                 pred_boxes, preds = model.forward(images) # [[B,4*regmax+nc,p3,p3],[B,4*regmax+nc,p4,p4],[B,4*regmax+nc,p5,p5],...]
-                preds = [[p[idx] for p in preds] for idx in range(batch_size)]# [[[4*regmax+nc,p3,p3],[4*regmax+nc,p4,p4],[4*regmax+nc,p5,p5]], ...]
-                targets, pos = self.create_targets(gt_boxes, preds)
-
-                for idx, (pred, img) in enumerate(zip(preds[0], [img1, img2, img3])):
-                    # preds.shape = [4*regmax+nc, gs,gs]
-                    st = self.imgsz // pred.shape[-1]
-                    gx, gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device), torch.arange(pred.shape[-1], device=self.device), indexing='xy')
-                    gx = ((gx.float() + 0.5) * st).reshape(-1)
-                    gy = ((gy.float() + 0.5) * st).reshape(-1)
-                    
-                    reg = pred[:4*self.regmax].reshape(4, self.regmax,-1)
-                    cls = pred[4*self.regmax:].reshape(self.nc, -1)
-                    cls_scores, cls_ids = cls.max(0)
-                    mask = cls_scores > 0.0005
-
-                    reg = (reg.softmax(dim=1) * self.proj).sum(1)*st+1 # [4, N]
-
-                    l,t,r,b = torch.split(reg, [1,1,1,1], dim=0)
-                    x1 = gx - l
-                    y1 = gy - t
-                    x2 = gx + r
-                    y2 = gy + b
-
-                    _pred_boxes = torch.cat([x1,y1,x2,y2], dim=0).T.to(dtype=torch.int32, device="cpu")
-                    _pred_boxes = _pred_boxes[mask.to(device="cpu")].tolist()
-                    gx = gx[mask].to(dtype=torch.int32).tolist()
-                    gy = gy[mask].to(dtype=torch.int32).tolist()
-
-                    for box in _pred_boxes:
-                        cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (0,255,0), 1)
-                    
-                    for x, y in zip(gx, gy):
-                        cv2.circle(img, (x,y), 1, (0,0,255), 2)
-
-                    frame[:, idx*img.shape[1]:(idx+1)*img.shape[1]] = img
                 
-                cv2.imshow("frame", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                batch_preds = [[p[idx] for p in preds] for idx in range(batch_size)]# [[[4*regmax+nc,p3,p3],[4*regmax+nc,p4,p4],[4*regmax+nc,p5,p5]], ...]
+                targets, pos, batch_pt_st = self.create_targets(gt_boxes, batch_preds, debug)
+
+                if debug:
+                    img = np.ascontiguousarray((images[0].permute(1,2,0)*255).to(device="cpu", dtype=torch.uint8).numpy())
+                    frames = np.zeros((self.imgsz*len(self.strides), self.imgsz*4, 3), dtype=np.uint8)
+
+                    for st_idx, st in enumerate(self.strides): # stride by stride for each image
+                        # p = [4*regmax+nc,p3,p3]
+                        frame = np.zeros((self.imgsz, self.imgsz*4, 3), dtype=np.uint8) # stride frame
+
+                        for assign_idx, assignments in enumerate(batch_pt_st[0]): # [c1, c2, c3, final]
+                            st_assignments = assignments[st_idx]
+                            img_cp = img.copy()
+                            for assignment in st_assignments:
+                                cx, cy = assignment
+                                cx = int(cx*self.imgsz)
+                                cy = int(cy*self.imgsz)
+                                img_cp = cv2.circle(img_cp, (cx, cy), 2, (255,0,0), 3)
+                            frame[:, assign_idx*self.imgsz:(assign_idx+1)*self.imgsz, :] = img_cp
+                        frame = cv2.putText(frame, f"stride: {st}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 2.8, (0, 0, 0), 4, cv2.LINE_AA)
+                        frames[st_idx*self.imgsz:(st_idx+1)*self.imgsz, :, :] = frame
+                    frames = cv2.putText(frames, f"Iter: {step}", (4*self.imgsz-800, 85), cv2.FONT_HERSHEY_SIMPLEX, 2.8, (255, 255, 255), 4, cv2.LINE_AA)
+                    ratio = int(self.imgsz)
+                    frames = cv2.resize(frames, (ratio*4, ratio*len(self.strides)))
+
+                    cv2.imshow("frame", cv2.cvtColor(frames, cv2.COLOR_BGR2RGB))
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
                 batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
                 self.map_metric.update(batch_pred_dicts, batch_target_dicts)
@@ -110,9 +98,10 @@ class Trainer:
                 map50_95 = batch_stats['map'].item()
                 self.map_metric.reset()
 
-                loss = self.calc_loss(preds, targets, pos)
+                loss = self.calc_loss(batch_preds, targets, pos)
                 loss.backward()
                 optimizer.step()
+                step = int(optimizer.state[next(iter(optimizer.state))]['step'])
                 losses.append(loss.item())
 
                 total = 33
@@ -303,20 +292,24 @@ class Trainer:
         loss = torchvision.ops.generalized_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
         return loss
 
-    def create_targets(self, gt_boxes:list[torch.Tensor], preds:list[list[torch.Tensor]]):
+    def create_targets(self, gt_boxes:list[torch.Tensor], preds:list[list[torch.Tensor]], debug=False):
         labels:list[list[torch.Tensor]] = []
         positive_anchors:list[list[torch.Tensor]] = []
-        for pred, gt_box in zip(preds, gt_boxes):
-            if 0 in gt_box.shape:
+        batch_pt_st: list[list] = []
+
+        for pred, gt_box in zip(preds, gt_boxes): # batch
+            if 0 in gt_box.shape: # no object
                 labels.append([torch.zeros((1, 4*self.regmax+self.nc, p.shape[-2], p.shape[-1]), device=self.device) for p in pred])
                 positive_anchors.append([torch.empty((0,0), device=self.device) for _ in range(len(pred))])
                 continue
-            label, pos = self.__create_targets(gt_box, pred)
+            label, pos, pt_st = self.__create_targets(gt_box, pred, debug)
             labels.append(label)
             positive_anchors.append(pos)
-        return labels, positive_anchors
+            batch_pt_st.append(pt_st)
 
-    def __create_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
+        return labels, positive_anchors, batch_pt_st
+
+    def __create_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor], debug=False):
         """
         Creates targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306\\
         This function is a combination of *create_c1_targets*, *create_c2_targets* and *create_c3_targets*\\
@@ -346,7 +339,6 @@ class Trainer:
             ] # labels for each stride
         
         positive_anchors:list[torch.Tensor] = []
-        
 
         for lb in labels:
             pos = []
@@ -365,8 +357,44 @@ class Trainer:
 
             positive_anchors.append(torch.tensor(pos, dtype=torch.long, device=self.device))
 
+        if debug:
+            c1_points = []
+            for _st in self.strides:
+                st_points = []
+                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c1_assignments.items():
+                    if st == _st:
+                        st_points.append([cx, cy])
+                c1_points.append(st_points)
 
-        return labels, positive_anchors
+            c2_points = []
+            for _st in self.strides:
+                st_points = []
+                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c2_assignments.items():
+                    if st == _st:
+                        st_points.append([cx, cy])
+                c2_points.append(st_points)
+
+            c3_points = []
+            for _st in self.strides:
+                st_points = []
+                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c3_assignments.items():
+                    if st == _st:
+                        st_points.append([cx, cy])
+                c3_points.append(st_points)
+
+            final_points = []
+            for _st in self.strides:
+                st_points = []
+                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in final_assignments.items():
+                    if st == _st:
+                        st_points.append([cx, cy])
+                final_points.append(st_points)
+
+            points_and_strides = [c1_points, c2_points, c3_points, final_points]
+
+            return labels, positive_anchors, points_and_strides
+
+        return labels, positive_anchors, None
 
     def __candidate3(self, assignments: dict, k: int=20):
         """

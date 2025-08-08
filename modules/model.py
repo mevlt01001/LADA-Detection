@@ -23,7 +23,7 @@ class Model(torch.nn.Module):
                  device=torch.device("cpu"),
                 ):
         super().__init__()
-        self.imgsz = max(64, 32*(imgsz//32))
+        self.imgsz = max(64, 32*(int(imgsz)//32))
         self.nc = nc
         self.regmax = regmax
         self.device = device
