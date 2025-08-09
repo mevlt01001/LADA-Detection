@@ -1,4 +1,6 @@
-from modules import UltrlyticsModel, Preprocess, Postprocess, Body, HybridBody, Head, DFL, torch
+from modules import UltrlyticsModel, Postprocess, Body, HybridBody, Head, DFL, YOLO, RTDETR
+import torch
+import os
 
 class Model(torch.nn.Module):
     """
@@ -19,18 +21,48 @@ class Model(torch.nn.Module):
     """
     def __init__(self, 
                  models: list[UltrlyticsModel], 
-                 nc:int, imgsz:int, regmax:int=None, 
+                 nc:int, 
+                 imgsz:int, 
+                 regmax:int=None, 
                  device=torch.device("cpu"),
+                 last_epoch:int=0,
+                 last_batch:int=0,
+                 optim_state_dict:dict=None,
+                 sched_state_dict:dict=None
                 ):
         super().__init__()
         self.imgsz = max(64, 32*(int(imgsz)//32))
         self.nc = nc
         self.regmax = regmax
         self.device = device
+        self.last_epoch = last_epoch
+        self.last_batch = last_batch
+        self.optim_state_dict = optim_state_dict
+        self.sched_state_dict = sched_state_dict
         self.backbone = self._load_hybrid_backbone(models) # HybridBackbone, Body
         self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.backbone.out_ch, device=device)
         self.dfl = DFL(regmax=self.regmax, nc=nc, imgsz=self.imgsz, device=device, grid_sizes=self.backbone.grid_sizes)        
         self.postprocess = Postprocess()
+
+    @classmethod
+    def from_ckpt(cls, checkpoint_path:os.PathLike, device=torch.device("cpu")):
+        ckpt = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+
+        inst = cls(
+            models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in ckpt["models"]],
+            nc=ckpt["nc"],
+            imgsz=ckpt["imgsz"],
+            regmax=ckpt["regmax"],
+            last_epoch=ckpt["last_epoch"],
+            last_batch=ckpt["last_batch"],
+            optim_state_dict=ckpt["optim_state_dict"],
+            sched_state_dict=ckpt["sched_state_dict"],
+            device=device
+        )
+
+        inst.load_state_dict(ckpt["model_state_dict"])
+
+        return inst
 
     def _load_hybrid_backbone(self, models: list[UltrlyticsModel]):
         available_tasks = ["detect"]
