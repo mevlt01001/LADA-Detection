@@ -18,7 +18,75 @@ import math
 
 warnings.filterwarnings("ignore")
 
-class Trainer:
+def debug_visualize(image: torch.Tensor,
+                    gt_boxes: torch.Tensor,
+                    imgsz: int,
+                    strides: list[int],
+                    pt_by_st: list[list[list[float, float, list[int, int, int]]]],
+                    ):
+    # image.shape = [3, H, W]
+    # gt_boxes.shape = [N, 5]
+    image = np.ascontiguousarray((image.permute(1,2,0)*255).to(device="cpu", dtype=torch.uint8).numpy())
+    if gt_boxes.shape[0] > 0:
+        _, cx, cy, w, h = torch.unbind(gt_boxes*imgsz, dim=1)
+        boxes = torch.stack((cx-w/2, cy-h/2, cx+w/2, cy+h/2), dim=1).tolist()
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box)
+            image = cv2.rectangle(image, (x1, y1), (x2, y2), (0,255,0), 1)
+
+    frames = np.zeros((imgsz*len(strides), imgsz*4, 3), dtype=np.uint8)
+
+    for st_idx in range(len(strides)):
+        frame = np.zeros((imgsz, imgsz*4, 3), dtype=np.uint8) # stride frame
+        for c_idx, candidates in enumerate(pt_by_st):
+            img_cp = image.copy()
+            for assignment in candidates[st_idx]:
+                cx = int(assignment[0]*imgsz)
+                cy = int(assignment[1]*imgsz)
+                color = assignment[2]
+                img_cp = cv2.circle(img_cp, (cx, cy), 4, color, 4)
+            img_cp = cv2.putText(img_cp, str(len(candidates[st_idx])) + " points", (10, imgsz-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            frame[:, c_idx*imgsz:(c_idx+1)*imgsz, :] = img_cp
+        frames[st_idx*imgsz:(st_idx+1)*imgsz, :, :] = frame
+    ratio = int(imgsz/1)
+
+    if (frames==0).all():
+        for st_idx in range(len(strides)):
+            frame = np.zeros((imgsz, imgsz*4, 3), dtype=np.uint8) # stride frame
+            for c_idx in range(4):                
+                frame[:, c_idx*imgsz:(c_idx+1)*imgsz, :] = image
+            frames[st_idx*imgsz:(st_idx+1)*imgsz, :, :] = frame
+
+    frames = cv2.resize(frames, (ratio*4, ratio*len(strides)))
+
+    cv2.imshow("debug_frame", cv2.cvtColor(frames, cv2.COLOR_BGR2RGB))
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        exit(404)
+
+def progress_bar(total:int=5,
+                 percentage:float=0.0,
+                 epoch:int=None,
+                 loss:float=None,                 
+                 mAP_50:float=None,
+                 mAP_50_95:float=None,
+                 val:bool=False
+                 ):
+    progress = math.floor((percentage)*total)
+    bar = f"{'█'*progress}{'░'*(total-progress)}"
+    msg = (
+    f"{f'Validation | ' if val else ''}"
+    f"{f'Epoch={epoch:03}' if epoch is not None else ''} "
+    f"{f'Loss={loss:<7.2f}' if loss is not None else ''} "
+    f"{f'mAP_50={mAP_50*100:<7.2f}' if mAP_50 is not None else ''} "
+    f"{f'mAP_50_95={mAP_50_95*100:<7.2f}' if mAP_50_95 is not None else ''} "
+    f"{f'{percentage*100:>7.2f}%{bar}  '}"
+    )
+    
+    sys.stdout.write("\r" + msg)
+    sys.stdout.flush()
+    
+
+class LADATrainer:
     """
     This class is a trainer for `Model` class.\\
     It provides to train `Model` class with Lightweight Anchor Dynamic Assignment (LADA) Algorithm https://doi.org/10.3390/s23146306\\
@@ -55,9 +123,16 @@ class Trainer:
               valid_path: str=None, 
               debug:bool=False,
             ):
+        
 
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
         valid_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images"))))) if valid_path is not None else None
+        
+        if self.last_ep/epoch > 0.95:
+            self.last_ep = 0
+        if self.last_batch/len(train_names) > 0.95:
+            self.last_batch = 0
+            self.last_ep += 1
 
         model = self.model.train(True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
@@ -74,6 +149,7 @@ class Trainer:
             losses = []
             last_batch = self.last_batch
             for i in range(last_batch, len(train_names), batch):
+                torch.cuda.empty_cache()
                 batch_size = batch if i+batch < len(train_names) else len(train_names)-i
                 optimizer.zero_grad()
 
@@ -84,45 +160,8 @@ class Trainer:
                 with torch.no_grad():
                     batch_preds_for_assign = [[p[idx].detach() for p in preds] for idx in range(batch_size)]
                     targets, pos, batch_pt_st = self.create_targets(gt_boxes, batch_preds_for_assign, debug)
-
                     if debug:
-                        img = np.ascontiguousarray((images[0].permute(1,2,0)*255).to(device="cpu", dtype=torch.uint8).numpy())
-                        if gt_boxes[0].shape[0] > 0:
-                            for gt_box in gt_boxes[0]:
-                                _d, cx, cy, w, h = gt_box*self.imgsz
-                                x1 = int(cx-w/2)
-                                y1 = int(cy-h/2)
-                                x2 = int(cx+w/2)
-                                y2 = int(cy+h/2)
-                                img = cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,0), 1)
-                        frames = np.zeros((self.imgsz*len(self.strides), self.imgsz*4, 3), dtype=np.uint8)
-
-                        for st_idx, st in enumerate(self.strides): # stride by stride for each image
-                            # p = [4*regmax+nc,p3,p3]
-                            frame = np.zeros((self.imgsz, self.imgsz*4, 3), dtype=np.uint8) # stride frame
-
-                            if len(batch_pt_st[0]) > 0:
-                                for assign_idx, assignments in enumerate(batch_pt_st[0]): # [c1, c2, c3, final]
-                                    st_assignments = assignments[st_idx]
-                                    img_cp = img.copy()
-                                    for assignment in st_assignments:
-                                        cx, cy, c = assignment
-                                        cx = int(cx*self.imgsz)
-                                        cy = int(cy*self.imgsz)
-                                        img_cp = cv2.circle(img_cp, (cx, cy), 5, (c[0], c[1], c[2]), 3)
-                                    img_cp = cv2.putText(img_cp, str(len(st_assignments)) + " points", (10, self.imgsz-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                                    frame[:, assign_idx*self.imgsz:(assign_idx+1)*self.imgsz, :] = img_cp
-                                frames[st_idx*self.imgsz:(st_idx+1)*self.imgsz, :, :] = frame
-                            else:
-                                for assign_idx in range(4):
-                                    frame[:, assign_idx*self.imgsz:(assign_idx+1)*self.imgsz, :] = img
-                                frames[st_idx*self.imgsz:(st_idx+1)*self.imgsz, :, :] = frame
-                        ratio = int(self.imgsz/1)
-                        frames = cv2.resize(frames, (ratio*4, ratio*len(self.strides)))
-
-                        cv2.imshow("frame", cv2.cvtColor(frames, cv2.COLOR_BGR2RGB))
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            break
+                        debug_visualize(images[0], gt_boxes[0], self.imgsz, self.strides, batch_pt_st[0])
 
                 batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
                 self.map_metric.update(batch_pred_dicts, batch_target_dicts)
@@ -137,19 +176,15 @@ class Trainer:
                 scheduler.step()
                 losses.append(loss.item())
 
-                total = 33
-                progress = (batch_size+i)*total//len(train_names)  # dolu hücre sayısı
-                bar = f"{'█'*progress}{'▒'*(total-progress)}"
+                progress_bar(total=33,
+                             percentage=(i+batch_size)/len(train_names),
+                             epoch=ep+1,
+                             loss=loss.item(),
+                             mAP_50=map50,
+                             mAP_50_95=map50_95,
+                             val=False
+                             )
 
-                msg = (
-                    f"Epoch={ep+1:04}/{epoch:04} "
-                    f"Loss={loss.item():<7.3f} "
-                    f"mAP@50={map50*100:<7.3f} "
-                    f"mAP@50:95={map50_95*100:<7.3f} | "
-                    f"{bar} %{(batch_size+i)/len(train_names)*100:7.3f}"
-                )
-                sys.stdout.write("\r" + msg)
-                sys.stdout.flush()
                 
                 model = model.train(False)
                 torch.save({
@@ -164,34 +199,40 @@ class Trainer:
                     "last_batch": i+batch
                     }, f"LADA_Last.pt")
                 model = model.train(True)
-                            
+            print(f" AvgLoss={sum(losses)/(len(losses)+10e-5):<6.4f}\n")                
             self.map_metric.reset()
+
+            batch = int(batch*8)
             
             if valid_path is not None:
-                torch.cuda.empty_cache()
-                model = model.train(False)
+                with torch.inference_mode():
+                    model = model.train(False)
+                    for i in range(0, len(valid_names), batch):
+                        torch.cuda.empty_cache()
+                        batch_size = batch if i+batch < len(valid_names) else len(valid_names)-i
+                        images, gt_boxes = self.__load_data(valid_names[i:batch_size+i], valid_path)
+                        pred_boxes = model.forward(images) # [B,4+nc,N]
+                        batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
+                        self.map_metric.update(batch_pred_dicts, batch_target_dicts)
+                        
+                        progress_bar(
+                            val=True,
+                            total=33,
+                            percentage=(i+batch_size)/len(valid_names),
+                            mAP_50=None,
+                            mAP_50_95=None,
+                        )
+                    batch_stats = self.map_metric.compute()
+                    map50 = batch_stats["map_50"].item()
+                    map50_95 = batch_stats['map'].item()
+                    print(f"  mAP_50={map50:<6.4f}  mAP_50_95={map50_95:<6.4f}\n")
+
+                    torch.cuda.empty_cache()
+                    model = model.train(True)
                 
-                pred_dicts = []
-                target_dicts = []
-
-                for i in range(0, len(valid_names), batch):
-                    batch_size = batch if i+batch < len(valid_names) else len(valid_names)-i
-                    images, gt_boxes = self.__load_data(valid_names[i:batch_size+i], valid_path)
-                    pred_boxes = model.forward(images) # [B,4+nc,N]
-                    batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
-                    pred_dicts.extend(batch_pred_dicts)
-                    target_dicts.extend(batch_target_dicts)
-
-                self.map_metric.update(pred_dicts, target_dicts)
-                batch_stats = self.map_metric.compute()
-                map50 = batch_stats["map_50"].item()
-                map50_95 = batch_stats['map'].item()
-                print(f" AvgLoss={sum(losses)/len(losses):<6.4f}\n\t"
-                      f" Valid | mAP@50={map50*100:<6.3f} mAP@50:95={map50_95*100:<6.3f}\n")
-                torch.cuda.empty_cache()
-                model = model.train(True)
-            
             self.map_metric.reset()
+
+            batch = int(batch/8)
 
         model = model.train(mode=False)
         self.model = model

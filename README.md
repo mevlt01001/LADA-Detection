@@ -6,4 +6,5 @@
 - Preprocess layer
 - Postprocess layer
 - ONNX NMS layer integration.
+- Resume Training.
 
