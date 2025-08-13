@@ -3,13 +3,15 @@
 # Training loss is different from paper
 ## Training Loss = λ1*Focal Loss + λ2*CIoU Loss + λ3*DFL | λ1:0.5, λ2:1.5, λ3:7.5
 """
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .model import Model
 
 import os, cv2
 import sys
 import torch
 import torchvision
 import numpy as np
-from modules import Model
 from PIL import Image
 from collections import defaultdict
 from torchmetrics.detection import MeanAveragePrecision 
@@ -85,7 +87,6 @@ def progress_bar(total:int=5,
     sys.stdout.write("\r" + msg)
     sys.stdout.flush()
     
-
 class LADATrainer:
     """
     This class is a trainer for `Model` class.\\
@@ -96,7 +97,7 @@ class LADATrainer:
     Methods:
         crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]): creates targets
     """
-    def __init__(self, model:Model):
+    def __init__(self, model:"Model"):
 
         self.model = model
         self.strides = model.backbone.strides
@@ -122,6 +123,8 @@ class LADATrainer:
               train_path: str, 
               valid_path: str=None, 
               debug:bool=False,
+              c2k = 9, # Best 9 anchors for each stride
+              c3k = 20 # Best 20 anchors for all strides
             ):
         
 
@@ -159,7 +162,7 @@ class LADATrainer:
                 
                 with torch.no_grad():
                     batch_preds_for_assign = [[p[idx].detach() for p in preds] for idx in range(batch_size)]
-                    targets, pos, batch_pt_st = self.create_targets(gt_boxes, batch_preds_for_assign, debug)
+                    targets, pos, batch_pt_st = self.create_targets(gt_boxes, batch_preds_for_assign, debug, c2k=c2k, c3k=c3k)
                     if debug:
                         debug_visualize(images[0], gt_boxes[0], self.imgsz, self.strides, batch_pt_st[0])
 
@@ -202,7 +205,7 @@ class LADATrainer:
             print(f" AvgLoss={sum(losses)/(len(losses)+10e-5):<6.4f}\n")                
             self.map_metric.reset()
 
-            batch = int(batch*8)
+            batch = int(batch*2)
             
             if valid_path is not None:
                 with torch.inference_mode():
@@ -225,14 +228,14 @@ class LADATrainer:
                     batch_stats = self.map_metric.compute()
                     map50 = batch_stats["map_50"].item()
                     map50_95 = batch_stats['map'].item()
-                    print(f"  mAP_50={map50:<6.4f}  mAP_50_95={map50_95:<6.4f}\n")
+                    print(f"  mAP_50={map50*100:<6.4f}  mAP_50_95={map50_95*100:<6.4f}\n")
 
                     torch.cuda.empty_cache()
                     model = model.train(True)
                 
             self.map_metric.reset()
 
-            batch = int(batch/8)
+            batch = int(batch/2)
 
         model = model.train(mode=False)
         self.model = model
@@ -382,7 +385,12 @@ class LADATrainer:
         loss = torchvision.ops.generalized_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
         return loss
 
-    def create_targets(self, gt_boxes:list[torch.Tensor], preds:list[list[torch.Tensor]], debug=False):
+    def create_targets(self, 
+                       gt_boxes:list[torch.Tensor], 
+                       preds:list[list[torch.Tensor]], 
+                       debug=False,
+                       c2k=9,
+                       c3k=20):
         labels:list[list[torch.Tensor]] = []
         positive_anchors:list[list[torch.Tensor]] = []
         batch_pt_st: list[list] = []
@@ -393,14 +401,19 @@ class LADATrainer:
                 positive_anchors.append([torch.empty((0,0), device=self.device) for _ in range(len(pred))])
                 batch_pt_st.append([])
                 continue
-            label, pos, pt_st = self.__create_targets(gt_box, pred, debug)
+            label, pos, pt_st = self.__create_targets(gt_box, pred, debug, c2k, c3k)
             labels.append(label)
             positive_anchors.append(pos)
             batch_pt_st.append(pt_st)
 
         return labels, positive_anchors, batch_pt_st
 
-    def __create_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor], debug=False):
+    def __create_targets(self, 
+                         gt_boxes:torch.Tensor, 
+                         preds:list[torch.Tensor], 
+                         debug=False, 
+                         c2k=9, 
+                         c3k=20):
         """
         Creates targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306\\
         This function is a combination of *create_c1_targets*, *create_c2_targets* and *create_c3_targets*\\
@@ -415,8 +428,8 @@ class LADATrainer:
             labels (list[torch.Tensor]): targets for each stride (...,p3,p4,p5,..)
         """
         c1_assignments = self.__candidate1(gt_boxes, preds) # EPCP areas anchor points assignment for each stride
-        c2_assignments = self.__candidate2(c1_assignments) # EPCP areas best 9 anchor points assignment for each stride
-        c3_assignments, avg_loss = self.__candidate3(c2_assignments) # Total best 20 anchor points assignment and average of its losses
+        c2_assignments = self.__candidate2(c1_assignments, k=c2k) # EPCP areas best 9 anchor points assignment for each stride
+        c3_assignments, avg_loss = self.__candidate3(c2_assignments, k=c3k) # Total best 20 anchor points assignment and average of its losses
         final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
 
         for (st, (j, i)), [(cx, cy), (box, loss)] in c3_assignments.items():

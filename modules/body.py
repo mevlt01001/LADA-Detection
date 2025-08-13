@@ -1,4 +1,6 @@
-from . import *
+from . import UltrlyticsModel, Detect, RTDETRDecoder, Concat
+import numpy as np
+import torch
 
 class Body(torch.nn.Module):
     """
@@ -58,7 +60,7 @@ class HybridBody(torch.nn.Module):
         self.strides = [imgsz // f.shape[-1] for f in out]
         self.grid_sizes = [f.shape[-1] for f in out]
 
-        self.regmax = int(np.sqrt((self.imgsz**2)/int(np.median([st**2 for st in self.strides])))/2) if regmax is None else regmax
+        self.regmax = int(min(self.grid_sizes)/2)+4 if regmax is None else regmax
         print(self)
 
     def __str__(self):

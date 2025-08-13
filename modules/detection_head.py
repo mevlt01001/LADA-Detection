@@ -1,4 +1,5 @@
-from . import *
+from . import Conv, DWConv
+import torch
 
 class Head(torch.nn.Module):
     """
