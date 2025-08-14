@@ -8,9 +8,9 @@ import onnx, onnxsim
 
 class LADAModel:
     def __init__(self,
-                 models: list[UltrlyticsModel], 
-                 nc:int, 
-                 imgsz:int, 
+                 models: list[UltrlyticsModel]|str,
+                 nc:int=None, 
+                 imgsz:int=None, 
                  regmax:int=None, 
                  device=torch.device("cpu"),
                  last_epoch:int=0,
@@ -18,17 +18,20 @@ class LADAModel:
                  optim_state_dict:dict=None,
                  sched_state_dict:dict=None):
         
-        self.model = Model(
-            models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in models],
-            nc=nc,
-            imgsz=imgsz,
-            regmax=regmax,
-            device=device,
-            last_epoch=last_epoch,
-            last_batch=last_batch,
-            optim_state_dict=optim_state_dict,
-            sched_state_dict=sched_state_dict
-        )
+        if os.path.splitext(models)[1] == ".pt":
+            self.model = Model.from_ckpt(models, device)
+        else:    
+            self.model = Model(
+                models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in models],
+                nc=nc,
+                imgsz=imgsz,
+                regmax=regmax,
+                device=device,
+                last_epoch=last_epoch,
+                last_batch=last_batch,
+                optim_state_dict=optim_state_dict,
+                sched_state_dict=sched_state_dict
+            )
     
     def load(self, path:os.PathLike, device=torch.device("cpu")):
         model = Model.from_ckpt(path, device)

@@ -4,7 +4,7 @@ from ultralytics.models.rtdetr import RTDETR
 from ultralytics.nn.modules.conv import Conv, DWConv
 from ultralytics.nn.modules import Detect, RTDETRDecoder, Concat
 
-from .body import Body, HybridBody
+from .backbone import Body, HybridBody
 from .detection_head import Head
 from .dfl_layer import DFL
 from .postprocess import Postprocess

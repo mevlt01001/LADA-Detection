@@ -1,6 +1,6 @@
 from . import UltrlyticsModel, YOLO, RTDETR
 from .postprocess import Postprocess
-from .body import Body, HybridBody
+from .backbone import Body, HybridBody
 from .detection_head import Head
 from .dfl_layer import DFL
 import torch
