@@ -125,8 +125,8 @@ For each candidate:
 ## Installation
 
 ```bash
-git clone <repo_url>
-cd LADA
+git clone https://github.com/mevlt01001/LADA-Detection.git
+cd LADA-Detection
 pip install -r requirements.txt
 ```
 
