@@ -18,11 +18,14 @@ class LADAModel:
                  optim_state_dict:dict=None,
                  sched_state_dict:dict=None):
         
-        if os.path.splitext(models)[1] == ".pt":
-            self.model = Model.from_ckpt(models, device)
+        _type = type(models)
+        
+        if _type == str:
+            if os.path.splitext(models)[-1] == ".pt":
+                self.model = Model.from_ckpt(models, device)
         else:    
             self.model = Model(
-                models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in models],
+                models=models,
                 nc=nc,
                 imgsz=imgsz,
                 regmax=regmax,
