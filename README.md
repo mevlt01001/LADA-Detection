@@ -1,8 +1,8 @@
 # Lightweight Anchor Dynamic Assignment (LADA) for Object Detection
 
-This repository provides a **training pipeline for [Ultralytics]() object detection models** that replaces the standard label/anchor assignment with the **Lightweight Anchor Dynamic Assignment ([LADA]())** algorithm.
+This repository provides a **training pipeline for [Ultralytics](https://github.com/ultralytics/ultralytics) object detection models** that replaces the standard label/anchor assignment with the **Lightweight Anchor Dynamic Assignment ([LADA](https://doi.org/10.3390/s23146306))** algorithm.
 
-LADA is a lightweight, dynamic matching strategy for selecting positive samples during training.  
+LADA is a lightweight, dynamic anchor assignment strategy for selecting positive samples during training.
 It reduces label noise, improves stability in crowded scenes, and works as **anchor-free detection head**.
 
 ---
@@ -13,14 +13,16 @@ It reduces label noise, improves stability in crowded scenes, and works as **anc
 - Improved **training stability in crowded and multi-object scenes**.
 - Simple to use Integrated into **Ultralytics Object Detection Models**.
 
-To more [LADA Paper](<ADD_PAPER_LINK>)
+To more [LADA Paper](https://doi.org/10.3390/s23146306)
 
 ---
 
 ## Background: Anchor Assignment
 
 **Anchors** (or more generally, candidate boxes/points) are a way to propose multiple potential object locations per image region.  
-This concept originated from **Region Proposal Networks** (RPN) in [Faster R-CNN](<ADD_LINK>), and later adapted to one-stage detectors like [SSD](<ADD_LINK>).
+This concept originated from **Region Proposal Networks** (RPN) in [Faster R-CNN](    
+https://doi.org/10.48550/arXiv.1506.01497), and later adapted to one-stage detectors like [SSD](    
+https://doi.org/10.48550/arXiv.1512.02325).
 
 Modern YOLO models:
 - Historically used **anchor-based heads**.
