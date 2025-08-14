@@ -38,6 +38,8 @@ In Ultralytics models, the typical architecture is:
 
     Backbone → Head (FPN included) → Detect
 
+![LADAModel Architecture](Assignments/architecture.png)
+
 
 ### 1. Backbone
 **Goal:** Extract multi-scale semantic features from the image.
