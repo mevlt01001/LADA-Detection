@@ -35,10 +35,6 @@ class LADAModel:
                 optim_state_dict=optim_state_dict,
                 sched_state_dict=sched_state_dict
             )
-    
-    def load(self, path:os.PathLike, device=torch.device("cpu")):
-        model = Model.from_ckpt(path, device)
-        self.model = model
 
     def train(self, 
               epoch:int, 

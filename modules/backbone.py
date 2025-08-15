@@ -60,7 +60,7 @@ class HybridBody(torch.nn.Module):
         self.strides = [imgsz // f.shape[-1] for f in out]
         self.grid_sizes = [f.shape[-1] for f in out]
 
-        self.regmax = int(min(self.grid_sizes)/2)+4 if regmax is None else regmax
+        self.regmax = max(3, int(min(self.grid_sizes)-min(self.grid_sizes)//8)) if regmax is None else regmax
         print(self)
 
     def __str__(self):

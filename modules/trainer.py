@@ -427,12 +427,13 @@ class LADATrainer:
         Returns:
             labels (list[torch.Tensor]): targets for each stride (...,p3,p4,p5,..)
         """
-        c1_assignments = self.__candidate1(gt_boxes, preds) # EPCP areas anchor points assignment for each stride
-        c2_assignments = self.__candidate2(c1_assignments, k=c2k) # EPCP areas best 9 anchor points assignment for each stride
-        c3_assignments, avg_loss = self.__candidate3(c2_assignments, k=c3k) # Total best 20 anchor points assignment and average of its losses
+        c1_assignments = self.__candidate1(gt_boxes, preds) # EPCP areas anchor points assignment for each stride        
+        c2_assignments = self.__candidate2(c1_assignments, gt_boxes, k=c2k) # EPCP areas best 9 anchor points assignment for each gt_boxfor each stride
+        c3_assignments, avg_loss = self.__candidate3(c2_assignments, k=c3k) # Best 20 anchor points assignment for each stride and average of its total losses
         final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
 
-        for (st, (j, i)), [(cx, cy), (box, loss)] in c3_assignments.items():
+        # c3[(_st, (j, i), (cx, cy))] = [box, loss]
+        for (st, (j, i), (cx, cy)), [box, loss] in c3_assignments.items():
             if loss < avg_loss: # Dynamic Loss Threshold(DLT)
                 final_assignments[(st, (j, i))] = [(cx, cy),(box, loss)]
 
@@ -469,7 +470,7 @@ class LADATrainer:
             c1_points = []
             for _st in self.strides:
                 st_points = []
-                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c1_assignments.items():
+                for (st, (j, i), (cx, cy)), [gt_box, loss] in c1_assignments.items():
                     if st == _st:
                         st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
                 c1_points.append(st_points)
@@ -477,7 +478,7 @@ class LADATrainer:
             c2_points = []
             for _st in self.strides:
                 st_points = []
-                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c2_assignments.items():
+                for (st, (j, i), (cx, cy)), [gt_box, loss] in c2_assignments.items():
                     if st == _st:
                         st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
                 c2_points.append(st_points)
@@ -485,7 +486,7 @@ class LADATrainer:
             c3_points = []
             for _st in self.strides:
                 st_points = []
-                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in c3_assignments.items():
+                for (st, (j, i), (cx, cy)), [gt_box, loss] in c3_assignments.items():
                     if st == _st:
                         st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
                 c3_points.append(st_points)
@@ -506,50 +507,66 @@ class LADATrainer:
 
     def __candidate3(self, assignments: dict, k: int=20):
         """
-        Select best k anchor points from total c2_assignments
+        Select best k anchor points for each stride from c2_assignments
 
         Args:
             assignments (defaultdict(list)): c2_assignments
 
         Returns:
-            c3_assignments (defaultdict(list)): Selected k anchor points from total c2_assignments
+            c3_assignments (defaultdict(list)): Selected k anchor points for each stride from c2_assignments
+            avg_loss (float): average of its losses
         """
-        # assingnments = {st: {grid_point: [gt, loss]}}
-        # calc select best k for each stride
-        c3_assignments = defaultdict(list)
-        sorted_assignments = sorted(assignments.items(), key=lambda x: x[1][1][1])
-        k = min(k, len(sorted_assignments))
-        losses = []
-        for (st, (j, i)), [(cx, cy), (box, loss)] in sorted_assignments[:k]:
-            c3_assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
-            losses.append(loss)
-        avg_loss = sum(losses)/len(losses) if len(losses) > 0 else 0
-        return c3_assignments, avg_loss
+        # c2[(st, (j, i), (cx, cy))] = [(box, loss)]
 
-    def __candidate2(self, assignments: dict, k: int=9):
+        c3 = defaultdict(list)
+        losses = []
+        for st in self.strides:
+            stride_group = []
+            for (_st, (j, i), (cx, cy)), [box, loss] in assignments.items():
+                if _st == st:
+                    stride_group.append(((_st, (j, i), (cx, cy)), [box, loss]))
+
+            end = min(k, len(stride_group))
+            stride_group = sorted(stride_group, key=lambda x:x[1][1])
+            
+            for (_st, (j, i), (cx, cy)), [box, loss] in stride_group[:end]:
+                c3[(_st, (j, i), (cx, cy))] = [box, loss]
+                losses.append(loss)
+
+        avg_loss = sum(losses)/(len(losses)+1e-6)
+
+        return c3, avg_loss
+
+    def __candidate2(self, c1_assignments: dict, gt_boxes: torch.Tensor, k: int=9):
         """
-        Select best k anchor points for each stride from c1_assignments
+        Select best k anchor points for each gtbox for each stride from c1_assignments
 
         Args:
             assignments (defaultdict(list)): c1_assignments
+            gt_boxes (torch.Tensor): ground truth boxes
+            k (int, optional): Number of point for each gt_box for each stride. Default is 9.
 
         Returns:
-            c2_assignments (defaultdict(list)): selected best k anchor points for each stride from c1_assignments
+            c2_assignments (defaultdict(list)): selected best k anchor points for each gt_box for each stride from c1_assignments
         """
-
+        # c1[(st, (j, i), (cx, cy))] = [best_box, best_loss]
         # select best k for each stride
-        c2_assignments = defaultdict(list)
-        for st in self.strides:
-            stride_groups = []
-            for (_st, (j, i)), [(cx, cy), (box, loss)] in assignments.items():
-                if _st == st:
-                    stride_groups.append(((_st, (j, i), (cx, cy)), (box, loss)))
-            sorted_stride_groups = sorted(stride_groups, key=lambda x: x[1][1])
-            k = min(k, len(sorted_stride_groups))
-            for (st, (j, i), (cx, cy)), (box, loss) in sorted_stride_groups[:k]: # 
-                c2_assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
 
-        return c2_assignments
+        c2 = defaultdict(list)
+                
+        for st in self.strides:
+            for box in gt_boxes:
+                boxes_groups = []
+                for (_st, (j, i), (cx, cy)), [_box, loss] in c1_assignments.items():
+                    if _st == st and _box.tolist() == box.tolist():
+                        boxes_groups.append(((_st, (j, i), (cx, cy)), (box, loss)))
+
+                end = min(k, len(boxes_groups))
+                sorted_boxes_groups = sorted(boxes_groups, key=lambda x: x[1][1])
+                for (_st, (j, i), (cx, cy)), (box, loss) in sorted_boxes_groups[:end]:
+                    c2[(st, (j, i), (cx, cy))] = [box, loss]
+                    
+        return c2
 
     def __candidate1(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
         """
@@ -566,7 +583,7 @@ class LADATrainer:
         # preds = [[1,4*regmax+nc,p3,p3],[1,4*regmax+nc,p4,p4],[1,4*regmax+nc,p5,p5]]
 
         assignments = defaultdict(list) # [st, grid_point, normalized_point, [gt, loss]]
-        def positive_areas(s, gt):
+        def EPCP(s, gt):
             # gt: [cls,cx,cy,w,h] (norm)
             r = math.sqrt(s/max(self.strides))
             pa = torchvision.ops.box_convert(
@@ -577,42 +594,34 @@ class LADATrainer:
         # Grid assignment
         for st in self.strides:
             for box in gt_boxes:
-                pa = positive_areas(st, box) # GT Box positive area xyxy, EPCP
-                i0 = int(torch.floor(pa[1]*self.imgsz/st).item())
-                j0 = int(torch.floor(pa[0]*self.imgsz/st).item())
-                i1 = int(torch.ceil(pa[3]*self.imgsz/st).item())
-                j1 = int(torch.ceil(pa[2]*self.imgsz/st).item())
-                for i in range(i0-1, i1+1):
-                    for j in range(j0-1, j1+1):
+                pa = EPCP(st, box) # GT Box positive area xyxy, EPCP
+                i0 = int(torch.floor(pa[1]*self.imgsz/st))
+                j0 = int(torch.floor(pa[0]*self.imgsz/st))
+                i1 = int(torch.ceil(pa[3]*self.imgsz/st))
+                j1 = int(torch.ceil(pa[2]*self.imgsz/st))
+                for i in range(i0, i1):
+                    for j in range(j0, j1):
                         cx = (j+0.5)*st/self.imgsz
                         cy = (i+0.5)*st/self.imgsz
                         if (pa[0].item() < cx < pa[2].item()) and (pa[1].item() < cy < pa[3].item()): # Check grid cell if in positive area
-                            assignments[(st, (j, i), (cx, cy))].append((box, -1)) # Assign to grid cell         
+                            assignments[(st, (j, i), (cx, cy))].append((box)) # Assign to grid cell         
 
-            # Multiple Assignment Handling
-            for (st, (j, i), (cx, cy)) , boxes in assignments.items():
-                if len(boxes) > 1: # Multiple assignment
-                    best_box = None
-                    best_dist = float('inf')
-                    for box,loss in boxes:
-                        bcx = box[1]
-                        bcy = box[2]
-                        dist = (bcx - cx)**2 + (bcy - cy)**2
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_box = box
-                    assignments[(st, (j, i), (cx, cy))] = [(best_box, -1)]
-
-        # Loss Calculation for preds tensor
-        _assignments = defaultdict(list)
+        # Loss assignment
+        c1 = defaultdict(list)
         for pred in preds:
             _st = self.imgsz//pred.shape[-1]
-            for (st, (j, i), (cx, cy)), [(box, loss)] in assignments.items(): # Assingments'e atama yapılmıyor.
+            for (st, (j, i), (cx, cy)), boxes in assignments.items():
                 if st == _st:
-                    loss = self.CLA(pred[:, i, j], box, (cx,cy), st)
-                    _assignments[(st, (j, i))] = [(cx, cy), (box, loss)]
+                    best_box = None
+                    best_loss = float('inf')
+                    for box in boxes:
+                        loss = self.CLA(pred[:, i, j], box, (cx,cy), st)
+                        if loss < best_loss:
+                            best_loss = loss
+                            best_box = box
+                    c1[(st, (j, i), (cx, cy))] = [best_box, best_loss]
         
-        return _assignments
+        return c1
        
     def CLA(self, pred:torch.Tensor, gt:torch.Tensor, anchor_point:tuple[int,int], stride:int):
         """
