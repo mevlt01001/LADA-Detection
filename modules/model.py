@@ -27,39 +27,45 @@ class Model(torch.nn.Module):
     """
     def __init__(self, 
                  models: list[UltrlyticsModel], 
-                 nc:int, 
                  imgsz:int, 
                  regmax:int=None, 
                  device=torch.device("cpu"),
                  last_epoch:int=0,
                  last_batch:int=0,
                  optim_state_dict:dict=None,
-                 sched_state_dict:dict=None
+                 sched_state_dict:dict=None,
+                 nc:int=None,
+                 names:list=None
                 ):
+        
         super().__init__()
+        print(imgsz)
         self.imgsz = max(64, 32*(int(imgsz)//32))
         self.nc = nc
+        self.cls_names = names
         self.regmax = regmax
         self.device = device
         self.last_epoch = last_epoch
         self.last_batch = last_batch
         self.optim_state_dict = optim_state_dict
-        self.sched_state_dict = sched_state_dict
-        # self.preprocess = Preprocess(imgsz=self.imgsz)
-        self.backbone = self._load_hybrid_backbone(models) # HybridBackbone, Body
-        self.head = Head(nc=nc, regmax=self.regmax, in_ch=self.backbone.out_ch, device=device)
-        self.dfl = DFL(regmax=self.regmax, nc=nc, imgsz=self.imgsz, device=device, grid_sizes=self.backbone.grid_sizes)        
+        self.sched_state_dict = sched_state_dict        
+        self.backbone = self._load_hybrid_backbone(models)
+        self.head = Head(nc=self.nc, regmax=self.regmax, in_ch=self.backbone.out_ch, device=self.device)
+        self.dfl = DFL(regmax=self.regmax, nc=self.nc, imgsz=self.imgsz, device=self.device, grid_sizes=self.backbone.grid_sizes)        
         self.postprocess = Postprocess()
 
     @classmethod
     def from_ckpt(cls, checkpoint_path:os.PathLike, device=torch.device("cpu")):
         ckpt = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+        print(ckpt.keys())
+        print(ckpt["models"])
 
         inst = cls(
             models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in ckpt["models"]],
-            nc=ckpt["nc"],
             imgsz=ckpt["imgsz"],
             regmax=ckpt["regmax"],
+            nc=ckpt["nc"],
+            names=ckpt["cls_names"],
             last_epoch=ckpt["last_epoch"],
             last_batch=ckpt["last_batch"],
             optim_state_dict=ckpt["optim_state_dict"],

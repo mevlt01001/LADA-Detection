@@ -3,7 +3,7 @@
 # Training loss is different from paper
 ## Training Loss = λ1*Focal Loss + λ2*CIoU Loss + λ3*DFL | λ1:0.5, λ2:1.5, λ3:7.5
 """
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple, Dict
 if TYPE_CHECKING:
     from .model import Model
 
@@ -14,21 +14,39 @@ import torchvision
 import numpy as np
 from PIL import Image
 from collections import defaultdict
-from torchmetrics.detection import MeanAveragePrecision 
+from torchmetrics.detection import MeanAveragePrecision
 import warnings
 import math
 
 warnings.filterwarnings("ignore")
 
 def debug_visualize(image: torch.Tensor,
-                    gt_boxes: torch.Tensor,
+                    gt_boxes: torch.Tensor, # [N, 5]: cls, cx, cy, w, h
+                    pred_boxes: torch.Tensor, # [N, 6]: xyxy, cls_score, cls_id
                     imgsz: int,
                     strides: list[int],
-                    pt_by_st: list[list[list[float, float, list[int, int, int]]]],
+                    pt_by_st: list[list],
+                    names: list[str],
                     ):
-    # image.shape = [3, H, W]
-    # gt_boxes.shape = [N, 5]
+    
+    num_strides = len(strides)
+
+    if pt_by_st is None or not isinstance(pt_by_st, list) or len(pt_by_st) != 4:
+        pt_by_st = [[], [], [], []]
+
+    norm = []
+    for candidates in pt_by_st:
+        if not isinstance(candidates, list):
+            candidates = []
+        if len(candidates) < num_strides:
+            candidates = candidates + [[] for _ in range(num_strides - len(candidates))]
+        elif len(candidates) > num_strides:
+            candidates = candidates[:num_strides]
+        norm.append(candidates)
+    pt_by_st = norm
+
     image = np.ascontiguousarray((image.permute(1,2,0)*255).to(device="cpu", dtype=torch.uint8).numpy())
+    img2 = image.copy()
     if gt_boxes.shape[0] > 0:
         _, cx, cy, w, h = torch.unbind(gt_boxes*imgsz, dim=1)
         boxes = torch.stack((cx-w/2, cy-h/2, cx+w/2, cy+h/2), dim=1).tolist()
@@ -47,28 +65,45 @@ def debug_visualize(image: torch.Tensor,
                 cy = int(assignment[1]*imgsz)
                 color = assignment[2]
                 img_cp = cv2.circle(img_cp, (cx, cy), 4, color, 4)
-            img_cp = cv2.putText(img_cp, str(len(candidates[st_idx])) + " points", (10, imgsz-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            img_cp = cv2.putText(img_cp, str(len(candidates[st_idx])) + " points", (10, imgsz-10),
+                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
             frame[:, c_idx*imgsz:(c_idx+1)*imgsz, :] = img_cp
         frames[st_idx*imgsz:(st_idx+1)*imgsz, :, :] = frame
+
     ratio = int(imgsz/1)
 
     if (frames==0).all():
         for st_idx in range(len(strides)):
             frame = np.zeros((imgsz, imgsz*4, 3), dtype=np.uint8) # stride frame
-            for c_idx in range(4):                
+            for c_idx in range(4):
                 frame[:, c_idx*imgsz:(c_idx+1)*imgsz, :] = image
             frames[st_idx*imgsz:(st_idx+1)*imgsz, :, :] = frame
+
+    mask = pred_boxes[:, 4] > 0.2
+    pred_boxes = pred_boxes[mask]
+    xyxy = pred_boxes[:, :4].int()
+    cls_score = pred_boxes[:, 4]
+    cls_id = pred_boxes[:, 5].int()
+
+    for xyxy, cls_score, cls_id in zip(xyxy, cls_score, cls_id):
+
+        x1, y1, x2, y2 = map(int, xyxy)
+        cv2.rectangle(img2, (x1, y1), (x2, y2), (0,0,255), 2)
+        label = f"cls:{names[cls_id.item()]} score:{cls_score.item():.2f}"
+        img2 = cv2.putText(img2, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+    # frames[:imgsz, imgsz*4:imgsz, :] = img2
 
     frames = cv2.resize(frames, (ratio*4, ratio*len(strides)))
 
     cv2.imshow("debug_frame", cv2.cvtColor(frames, cv2.COLOR_BGR2RGB))
+    cv2.imshow("debug_img", cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
     if cv2.waitKey(1) & 0xFF == ord('q'):
         exit(404)
 
 def progress_bar(total:int=5,
                  percentage:float=0.0,
                  epoch:int=None,
-                 loss:float=None,                 
+                 loss:float=None,
                  mAP_50:float=None,
                  mAP_50_95:float=None,
                  val:bool=False
@@ -83,22 +118,21 @@ def progress_bar(total:int=5,
     f"{f'mAP_50_95={mAP_50_95*100:<7.2f}' if mAP_50_95 is not None else ''} "
     f"{f'{percentage*100:>7.2f}%{bar}  '}"
     )
-    
+
     sys.stdout.write("\r" + msg)
     sys.stdout.flush()
-    
+
 class LADATrainer:
     """
-    This class is a trainer for `Model` class.\\
-    It provides to train `Model` class with Lightweight Anchor Dynamic Assignment (LADA) Algorithm https://doi.org/10.3390/s23146306\\
+    Trainer for `Model` with LADA assignment (C1→C2→C3 + DLT). *** For more information, see https://doi.org/10.3390/s23146306
 
-    Args:
-        model (Model): HybridNet and Head models which are processed ultralytics models
     Methods:
-        crate_targets(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]): creates targets
+      - train(...)
+      - create_targets(...)
+      - calc_loss(...), __calc_dfl, __calc_CIoU
     """
     def __init__(self, model:"Model"):
-
+        self.cls_names = model.cls_names
         self.model = model
         self.strides = model.backbone.strides
         self.imgsz = model.imgsz
@@ -110,30 +144,49 @@ class LADATrainer:
         self.last_batch = model.last_batch
         self.optim_state_dict = self.model.optim_state_dict
         self.sched_state_dict = self.model.sched_state_dict
+        self.max_stride = max(self.strides)
 
+        # mAP
         self.map_metric = MeanAveragePrecision(
             box_format='xyxy',
             backend='faster_coco_eval',
             class_metrics=False
-            ).to(self.device)
+        ).to(self.device)
 
-    def train(self, 
-              epoch:int, 
-              batch:int, 
-              train_path: str, 
-              valid_path: str=None, 
+        self.grid_cache: Dict[int, Dict[str, torch.Tensor|int]] = {}
+        self._build_grid_cache()
+
+    def _build_grid_cache(self):
+        self.grid_cache.clear()
+        for st in self.strides:
+            H = W = self.imgsz // st
+            jj, ii = torch.meshgrid(
+                torch.arange(W, device=self.device),
+                torch.arange(H, device=self.device),
+                indexing='xy'
+            )
+            cx = (jj.float() + 0.5) * st / self.imgsz  # [H,W] normalized
+            cy = (ii.float() + 0.5) * st / self.imgsz  # [H,W]
+            self.grid_cache[st] = {
+                "cx": cx, "cy": cy, "H": H, "W": W
+            }
+    
+    def train(self,
+              epoch:int,
+              batch:int,
+              train_path: str,
+              valid_path: str=None,
               debug:bool=False,
-              c2k = 9, # Best 9 anchors for each stride
-              c3k = 20 # Best 20 anchors for all strides
-            ):
-        
+              c2k:int=9,   # per-gt per-stride
+              c3k:int=20   # per-stride
+              ):
 
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
-        valid_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images"))))) if valid_path is not None else None
-        
+        valid_names = None if valid_path is None else np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images")))))
+
         if self.last_ep/epoch > 0.95:
             self.last_ep = 0
-        if self.last_batch/len(train_names) > 0.95:
+        if len(train_names) > 0 and self.last_batch/len(train_names) > 0.95:
             self.last_batch = 0
             self.last_ep += 1
 
@@ -142,29 +195,39 @@ class LADATrainer:
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=1e-3,
-            epochs=epoch - self.last_ep, steps_per_epoch=max(1, len(train_names)//batch)
+            optimizer, max_lr=0.008,
+            epochs=max(1, epoch - self.last_ep),
+            steps_per_epoch=math.ceil(len(train_names)/max(1,batch))
         )
         if self.sched_state_dict is not None:
             scheduler.load_state_dict(self.sched_state_dict)
 
-        for ep in range(self.last_ep,epoch):
+        for ep in range(self.last_ep, epoch):
             losses = []
             last_batch = self.last_batch
             for i in range(last_batch, len(train_names), batch):
-                torch.cuda.empty_cache()
+                # NOT calling empty_cache() here on purpose (big slowdown).
                 batch_size = batch if i+batch < len(train_names) else len(train_names)-i
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 images, gt_boxes = self.__load_data(train_names[i:batch_size+i], train_path)
-                pred_boxes, preds = model.forward(images) # [[B,4*regmax+nc,p3,p3],[B,4*regmax+nc,p4,p4],[B,4*regmax+nc,p5,p5],...]
-                batch_preds_for_loss = [[p[idx] for p in preds] for idx in range(batch_size)]# [[[4*regmax+nc,p3,p3],[4*regmax+nc,p4,p4],[4*regmax+nc,p5,p5]], ...]
-                
+                pred_boxes, preds = model.forward(images) # preds: [[B,C,p,p],...]
+                batch_preds_for_loss = [[p[idx] for p in preds] for idx in range(len(gt_boxes))]  # [[C,p,p], ...]
+
                 with torch.no_grad():
-                    batch_preds_for_assign = [[p[idx].detach() for p in preds] for idx in range(batch_size)]
+                    batch_preds_for_assign = [
+                        [p[idx].detach() for p in preds] 
+                        for idx in range(len(gt_boxes))] # [[[4*regmax+nc, H, W] for each stride] for each batch]
                     targets, pos, batch_pt_st = self.create_targets(gt_boxes, batch_preds_for_assign, debug, c2k=c2k, c3k=c3k)
                     if debug:
-                        debug_visualize(images[0], gt_boxes[0], self.imgsz, self.strides, batch_pt_st[0])
+                        debug_visualize(
+                            images[0], 
+                            gt_boxes[0], 
+                            pred_boxes[0], 
+                            self.imgsz, 
+                            self.strides, 
+                            batch_pt_st[0],
+                            model.cls_names)
 
                 batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
                 self.map_metric.update(batch_pred_dicts, batch_target_dicts)
@@ -180,7 +243,7 @@ class LADATrainer:
                 losses.append(loss.item())
 
                 progress_bar(total=33,
-                             percentage=(i+batch_size)/len(train_names),
+                             percentage=(i+batch_size)/max(1,len(train_names)),
                              epoch=ep+1,
                              loss=loss.item(),
                              mAP_50=map50,
@@ -188,11 +251,12 @@ class LADATrainer:
                              val=False
                              )
 
-                
+                # checkpoint (eval=False → BN/statics don’t move)
                 model = model.train(False)
                 torch.save({
                     "models": self.model.backbone.model_names,
                     "nc": self.nc,
+                    "cls_names": self.cls_names,
                     "imgsz": self.imgsz,
                     "regmax": self.regmax,
                     "model_state_dict": model.state_dict(),
@@ -202,26 +266,26 @@ class LADATrainer:
                     "last_batch": i+batch
                     }, f"LADA_Last.pt")
                 model = model.train(True)
-            print(f" AvgLoss={sum(losses)/(len(losses)+10e-5):<6.4f}\n")                
+
+            print(f" AvgLoss={sum(losses)/(len(losses)+1e-5):<6.4f}\n")
             self.map_metric.reset()
 
-            batch = int(batch*2)
-            
-            if valid_path is not None:
+            # validation
+            batch_eval_size = int(batch*2)
+            if valid_path is not None and len(valid_names) > 0:
                 with torch.inference_mode():
                     model = model.train(False)
-                    for i in range(0, len(valid_names), batch):
-                        torch.cuda.empty_cache()
-                        batch_size = batch if i+batch < len(valid_names) else len(valid_names)-i
+                    for i in range(0, len(valid_names), batch_eval_size):
+                        batch_size = batch_eval_size if i+batch_eval_size < len(valid_names) else len(valid_names)-i
                         images, gt_boxes = self.__load_data(valid_names[i:batch_size+i], valid_path)
                         pred_boxes = model.forward(images) # [B,4+nc,N]
                         batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
                         self.map_metric.update(batch_pred_dicts, batch_target_dicts)
-                        
+
                         progress_bar(
                             val=True,
                             total=33,
-                            percentage=(i+batch_size)/len(valid_names),
+                            percentage=(i+batch_size)/max(1,len(valid_names)),
                             mAP_50=None,
                             mAP_50_95=None,
                         )
@@ -230,534 +294,503 @@ class LADATrainer:
                     map50_95 = batch_stats['map'].item()
                     print(f"  mAP_50={map50*100:<6.4f}  mAP_50_95={map50_95*100:<6.4f}\n")
 
-                    torch.cuda.empty_cache()
                     model = model.train(True)
-                
-            self.map_metric.reset()
 
-            batch = int(batch/2)
+            self.map_metric.reset()
 
         model = model.train(mode=False)
         self.model = model
-    
-    def __load_data(self, names: list[str], path: str):
+
+    def __load_data(self, names: List[str], path: str):
         if path is None:
             return None, None
 
         images = []
         bboxes = []
         for file_name in names:
-            image = self.__load_image(os.path.join(path+"/images", file_name))
-            bbox = self.__load_gt_boxes(os.path.join(path+"/labels", file_name))
+            image = self.__load_image(os.path.join(path,"images", file_name))
+            bbox = self.__load_gt_boxes(os.path.join(path,"labels", file_name))
+            if bbox is None:
+                continue
             images.append(image)
             bboxes.append(bbox)
 
         return torch.cat(images, dim=0), bboxes
 
     def __load_image(self, path: str):
-        # path is a path to an image
         img = torch.from_numpy(np.array(Image.open(path+".jpg").convert("RGB"))).to(device=self.device)
         assert img.ndim == 3, f"Image({path}.jpg) must have 3 dimensions"
         img = self.__preprocess(img)
         return img
-    
+
     def __load_gt_boxes(self, path: str):
-        data = np.loadtxt(path+".txt", dtype=np.float32)
+        try:
+            data = np.loadtxt(path+".txt", dtype=np.float32)
+            if data.shape[-1] != 5:
+                return None
+        except:
+            return None
         if data.size == 0:
             data = np.empty((0,5), dtype=np.float32)
         elif data.ndim == 1:
             data = np.reshape(data, (1,5))
-        return torch.from_numpy(data).to(device=self.device)# [N, 5]
+        return torch.from_numpy(data).to(device=self.device) # [N,5]
 
     def __preprocess(self, x: torch.Tensor):
-        # x is an image shaped like (H, W, 3)
-        # this func converts x to (1, 3, self.imgsz, self.imgsz)
         x = x.to(torch.float32)
         x = x.permute(2, 0, 1).unsqueeze(0) # [H,W,3] -> [1,3,H,W]
         x = torch.nn.functional.interpolate(x, size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False)
         x = x*(1.0/255.0)
-
         return x
-    
-    def calc_loss(self,preds:list[list[torch.Tensor]], 
-                  targets:list[list[torch.Tensor]], 
-                  positive_anchors:list[list[torch.Tensor]]):
-        loss = 0
+
+    def calc_loss(self, preds: List[List[torch.Tensor]],
+                  targets: List[List[torch.Tensor]],
+                  positive_anchors: List[List[torch.Tensor]]):
+        loss = 0.0
         for pred, target, pos in zip(preds, targets, positive_anchors):
             loss += self.__calc_loss(pred, target, pos)
         return loss/len(preds)
 
-    def __calc_loss(self,pred:list[torch.Tensor], 
-                  targets:list[torch.Tensor], 
-                  positive_anchors:list[torch.Tensor],                  
-                  ):
-        # Training wil generating in batch = 1
-        # gt: [N, 5] (cls_id, cx, cy, w, h)
-        # pred: [1, 4*regmax+nc, H, W]
-        # targets: [1, 4*regmax+nc, H, W]
-        # positive_anchors: [[H, W], ...]
+    def __calc_loss(self, pred: list[torch.Tensor],
+                    targets: list[torch.Tensor],
+                    positive_anchors: list[torch.Tensor]):
+        """
+        pred:     per-stride [C,H,W]  (model output)
+        targets:  per-stride [1,C,H,W] (create_targets output)
+        positive_anchors: per-stride [[i,j], ...]
+        """
+        # Align targets and predictions by H×W size
+        tgt_by_hw = { (t.shape[-2], t.shape[-1]): (t, positive_anchors[k]) for k, t in enumerate(targets) }
+        ordered_tgts, ordered_pos = [], []
+        for p in pred:
+            key = (p.shape[-2], p.shape[-1])
+            if key in tgt_by_hw:
+                t, pos = tgt_by_hw[key]
+            else:
+                C = 4*self.regmax + self.nc
+                t = torch.zeros((1, C, p.shape[-2], p.shape[-1]), device=self.device)
+                pos = torch.empty((0,2), device=self.device, dtype=torch.long)
+            ordered_tgts.append(t)
+            ordered_pos.append(pos)
 
-        total_pos = [pos.shape for pos in positive_anchors]
-        # print("total_pos : ", total_pos)
+        targets = ordered_tgts # [[1,C,H,W]...]
+        positive_anchors = ordered_pos # [[i,j]...]
 
-        pred_reg = [p[:4*self.regmax, :, :] for p in pred] # [4*regmax, H, W]
-        truth_reg = [t[0, :4*self.regmax, :, :] for t in targets] # [4*regmax, H, W]
-        pred_cls = [p[4*self.regmax:, :, :].reshape(self.nc, -1).T for p in pred] # [N, nc]
-        truth_cls = [t[0, 4*self.regmax:, :, :].reshape(self.nc, -1).T for t in targets] # [N, nc]
+        # 2) Reg and Cls Tensors
+        pred_reg = [p[:4*self.regmax, :, :] for p in pred]                      # [4R,H,W]
+        truth_reg = [t[0, :4*self.regmax, :, :] for t in targets]               # [4R,H,W]
+        pred_cls  = [p[4*self.regmax:, :, :].reshape(self.nc, -1).T for p in pred]         # [N,nc]
+        truth_cls = [t[0, 4*self.regmax:, :, :].reshape(self.nc, -1).T for t in targets]   # [N,nc]
 
-        # Distributed Focal Loss
-        dfl_loss = 0
+        # 3) DFL
+        dfl_loss = 0.0
         for p, t, pos in zip(pred_reg, truth_reg, positive_anchors):
-            if pos.shape[0] == 0:
+            if pos.numel() == 0:
                 continue
             dfl_loss += self.__calc_dfl(p, t, pos)
 
-        # Calc CIoU loss
-        ciou_loss = 0 # NAN HATASI BURDA GELİYOR.
+        # 4) CIoU
+        ciou_loss = 0.0
         for p, t, pos in zip(pred_reg, truth_reg, positive_anchors):
-            if pos.shape[0] == 0:
+            if pos.numel() == 0:
                 continue
             ciou_loss += self.__calc_CIoU(p, t, pos)
 
-        # Calc Clasification Focal Loss
-        cls_loss = 0
+        # 5) Classification focal
+        cls_loss = 0.0
         for p, t in zip(pred_cls, truth_cls):
+            t = t.to(dtype=p.dtype)
             cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')
 
-        # print(f"cls_loss: {cls_loss}, ciou_loss: {ciou_loss}, dfl_loss: {dfl_loss}")
-
+        # 6) Loss balance
         w = [0.5, 1.5, 7.5]
-
         return cls_loss*w[0] + ciou_loss*w[1] + dfl_loss*w[2]
-    
+
     def __calc_dfl(self, pred:torch.Tensor, target:torch.Tensor, positive_anchors:torch.Tensor):
         # pred: [4*regmax,H,W]
-        # taget: [4*regmax,H,w]
-
-        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
-        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
+        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]]   # [4*regmax,N]
+        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]]# [4*regmax,N]
 
         target = target.view(4, self.regmax, target.shape[-1]) # [4,regmax,N]
-        pred = pred.view(4, self.regmax, pred.shape[-1]) # [4,regmax,N]
-        pred = torch.log_softmax(pred, dim=1) # [4,regmax,N]
-        
+        pred = pred.view(4, self.regmax, pred.shape[-1])       # [4,regmax,N]
+        pred = torch.log_softmax(pred, dim=1)
         loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')
         return loss
 
     def __calc_CIoU(self, pred: torch.Tensor, target: torch.Tensor, positive_anchors: torch.Tensor):
         # pred.shape = [4*regmax, H, W]
-        # target.shape = [4*regmax, H, W]
         st = self.imgsz//pred.shape[-1]
-        gx,gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device), 
-                               torch.arange(pred.shape[-1], device=self.device), 
+        gx,gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device),
+                               torch.arange(pred.shape[-1], device=self.device),
                                indexing='xy')
+        gx = gx[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
+        gy = gy[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
+        gx = (gx+0.5)*st / self.imgsz  # normalize to 0..1
+        gy = (gy+0.5)*st / self.imgsz
 
-        gx = gx[positive_anchors[:, 0], positive_anchors[:, 1]] # [N]
-        gy = gy[positive_anchors[:, 0], positive_anchors[:, 1]] # [N]
-        gx = (gx.float()+0.5)*st 
-        gy = (gy.float()+0.5)*st
-        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
-        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax, N]
-
+        pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax,N]
+        target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax,N]
 
         pred = pred.reshape(4, self.regmax, -1) # [4,regmax,N]
         target = target.reshape(4, self.regmax, -1) # [4,regmax,N]
 
         pred = torch.softmax(pred, dim=1)
-        pred = (pred*self.proj).sum(1, keepdim=False)*st # [4,N]
-        target = (target*self.proj).sum(1, keepdim=False)*st # [4,N]
+        pred = (pred*self.proj).sum(1, keepdim=False) / self.regmax  # [4,N] (scale ~ 0..1)
+        target = (target*self.proj).sum(1, keepdim=False) / self.regmax # [4,N]
 
         l,t,r,b = pred.split([1,1,1,1], dim=0) # [1,N]
-        x1 = gx - l
-        y1 = gy - t
-        x2 = gx + r
-        y2 = gy + b
-        pred_xyxy = torch.cat([x1,y1,x2,y2], dim=0).T # [4,N] -> [N,4]
-
+        x1 = gx - l.squeeze(0)
+        y1 = gy - t.squeeze(0)
+        x2 = gx + r.squeeze(0)
+        y2 = gy + b.squeeze(0)
+        pred_xyxy = torch.stack([x1,y1,x2,y2], dim=1) # [N,4]
 
         l,t,r,b = target.split([1,1,1,1], dim=0) # [1,N]
-        x1 = gx - l
-        y1 = gy - t
-        x2 = gx + r
-        y2 = gy + b
-        target_xyxy = torch.cat([x1,y1,x2,y2], dim=0).T # [4,N] -> [N,4]
+        x1 = gx - l.squeeze(0)
+        y1 = gy - t.squeeze(0)
+        x2 = gx + r.squeeze(0)
+        y2 = gy + b.squeeze(0)
+        target_xyxy = torch.stack([x1,y1,x2,y2], dim=1) # [N,4]
 
         loss = torchvision.ops.generalized_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
         return loss
 
-    def create_targets(self, 
-                       gt_boxes:list[torch.Tensor], 
-                       preds:list[list[torch.Tensor]], 
-                       debug=False,
-                       c2k=9,
-                       c3k=20):
-        labels:list[list[torch.Tensor]] = []
-        positive_anchors:list[list[torch.Tensor]] = []
-        batch_pt_st: list[list] = []
+    def create_targets(self,
+                       gt_boxes: List[torch.Tensor],    # [[N, 5]for each batch] 5: cls, cx, cy w, h (in 0-1)
+                       preds: List[List[torch.Tensor]], # [[[4*regmax+nc, H, W] for each stride] for each batch]
+                       debug: bool=False,
+                       c2k: int=9,
+                       c3k: int=20):
+        labels: List[List[torch.Tensor]] = []
+        positive_anchors: List[List[torch.Tensor]] = []
+        batch_pt_st: List[List] = []
 
-        for pred, gt_box in zip(preds, gt_boxes): # batch
-            if 0 in gt_box.shape: # no object
+        for pred, gt_box in zip(preds, gt_boxes):  # batch
+            if 0 in gt_box.shape:  # no object
                 labels.append([torch.zeros((1, 4*self.regmax+self.nc, p.shape[-2], p.shape[-1]), device=self.device) for p in pred])
-                positive_anchors.append([torch.empty((0,0), device=self.device) for _ in range(len(pred))])
-                batch_pt_st.append([])
+                positive_anchors.append([torch.empty((0,2), device=self.device, dtype=torch.long) for _ in range(len(pred))])
+                batch_pt_st.append([[],[],[],[]] if debug else None)
                 continue
-            label, pos, pt_st = self.__create_targets(gt_box, pred, debug, c2k, c3k)
+
+            label, pos, pts = self._assign_lada_vectorized(gt_box, pred, debug, c2k=c2k, c3k=c3k)
             labels.append(label)
             positive_anchors.append(pos)
-            batch_pt_st.append(pt_st)
+            batch_pt_st.append(pts if debug else None)
 
         return labels, positive_anchors, batch_pt_st
 
-    def __create_targets(self, 
-                         gt_boxes:torch.Tensor, 
-                         preds:list[torch.Tensor], 
-                         debug=False, 
-                         c2k=9, 
-                         c3k=20):
+    @torch.no_grad()
+    def _assign_lada_vectorized(self,
+                                gt_boxes: torch.Tensor,       # [N,5] (cls,cx,cy,w,h) norm
+                                preds: List[torch.Tensor],    # [[4*regmax+nc,H,W] for each stride]
+                                debug: bool,
+                                c2k: int,
+                                c3k: int):
         """
-        Creates targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306\\
-        This function is a combination of *create_c1_targets*, *create_c2_targets* and *create_c3_targets*\\
-        Additionally, it applies **Dynamic Loss Threshold(DLT)** over *create_c3_targets* by using average loss\\
-        https://doi.org/10.3390/s23146306 --> 3.3. Dynamic Loss Threshold
-
-        Args:
-            gt_boxes (torch.Tensor): ground truth boxes shaped like (n,5) (cls_id,cx,cy,w,h), normalized[0-1]
-            preds (list[torch.Tensor]): (..,p3,p4,p5,..) predictions [4*regmax+nc,H,W]
-
-        Returns:
-            labels (list[torch.Tensor]): targets for each stride (...,p3,p4,p5,..)
+        C1: EPCP area candiadates
+        C2: top-k candidates for each gt for each stride
+        C3: top-k candidates for each gt
+        Final: cC3 candidates > avg_loss(C3)
         """
-        c1_assignments = self.__candidate1(gt_boxes, preds) # EPCP areas anchor points assignment for each stride        
-        c2_assignments = self.__candidate2(c1_assignments, gt_boxes, k=c2k) # EPCP areas best 9 anchor points assignment for each gt_boxfor each stride
-        c3_assignments, avg_loss = self.__candidate3(c2_assignments, k=c3k) # Best 20 anchor points assignment for each stride and average of its total losses
-        final_assignments = defaultdict(list) # it will use to apply Dynamic Loss Threshold, DLT
+        G = gt_boxes.shape[0]
+        device = self.device
+        C1_points_by_st = []
+        C2_points_by_st = []
+        C3_points_by_st = []
+        FINAL_points_by_st = []
 
-        # c3[(_st, (j, i), (cx, cy))] = [box, loss]
-        for (st, (j, i), (cx, cy)), [box, loss] in c3_assignments.items():
-            if loss < avg_loss: # Dynamic Loss Threshold(DLT)
-                final_assignments[(st, (j, i))] = [(cx, cy),(box, loss)]
+        # Collect all labels and positive anchors
+        labels_per_stride: List[torch.Tensor] = []
+        pos_per_stride: List[torch.Tensor] = []
+        all_losses_for_dlt = []
 
+        c3_candidates_per_st = {}
 
-        labels = [
-            torch.zeros((1, 4*self.regmax+self.nc, self.imgsz//st, self.imgsz//st), device=self.device) 
-            for st in self.strides
-            ] # labels for each stride
-        
-        positive_anchors:list[torch.Tensor] = []
-
-        for lb in labels:
-            pos = []
-            for (st, (j, i)), [(cx, cy), (gt_box, loss)] in final_assignments.items():
-                if st == self.imgsz//lb.shape[-1]: # Check stride
-                    pos.append([i, j])
-                    cls_label = torch.nn.functional.one_hot(gt_box[0].long(), self.nc)
-                    x1, y1, x2, y2 = torchvision.ops.box_convert(gt_box[1:], 'cxcywh', 'xyxy')
-                    l = (cx - x1)*st
-                    t = (cy - y1)*st
-                    r = (x2 - cx)*st
-                    b = (y2 - cy)*st
-                    ltrb_dist = self.distribute(l, t, r, b)
-                    label = torch.cat([ltrb_dist, cls_label], dim=0)
-                    lb[0, :, i, j] = label
-
-            positive_anchors.append(torch.tensor(pos, dtype=torch.long, device=self.device))
-
+        color_map = {}
         if debug:
-            box_and_color = {}
-            for gt_box in gt_boxes:
-                box_and_color[tuple(gt_box.tolist())] = np.random.randint(0, 255, 3).tolist()
+            for gb in gt_boxes:
+                color_map[tuple(gb.tolist())] = np.random.randint(0, 255, 3).tolist()
 
-            c1_points = []
-            for _st in self.strides:
-                st_points = []
-                for (st, (j, i), (cx, cy)), [gt_box, loss] in c1_assignments.items():
-                    if st == _st:
-                        st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
-                c1_points.append(st_points)
+        for p in preds: # [[4*regmax+nc, H, W] for each stride]
+            # p.shape = [4*regmax+nc, H, W]
+            st = self.imgsz // p.shape[-1]
+            cache = self.grid_cache[st]
+            H, W = cache["H"], cache["W"]
+            cx_map, cy_map = cache["cx"], cache["cy"]        # [H,W]
+            # EPCP (G,4) (xyxy, norm)
+            r = math.sqrt(st / self.max_stride)
+            pa_xyxy = torchvision.ops.box_convert(
+                torch.stack([gt_boxes[:,1], gt_boxes[:,2], gt_boxes[:,3]*r, gt_boxes[:,4]*r], dim=1),
+                'cxcywh', 'xyxy'
+            ).clamp_(0, 1)  # [G,4]
 
-            c2_points = []
-            for _st in self.strides:
-                st_points = []
-                for (st, (j, i), (cx, cy)), [gt_box, loss] in c2_assignments.items():
-                    if st == _st:
-                        st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
-                c2_points.append(st_points)
+            # [1,H,W] → [G,H,W]
+            CX = cx_map.unsqueeze(0).expand(G, H, W)
+            CY = cy_map.unsqueeze(0).expand(G, H, W)
+            x1,y1,x2,y2 = pa_xyxy[:,0].view(G,1,1), pa_xyxy[:,1].view(G,1,1), pa_xyxy[:,2].view(G,1,1), pa_xyxy[:,3].view(G,1,1)
+            inside = (CX > x1) & (CX < x2) & (CY > y1) & (CY < y2)    # [G,H,W]
 
-            c3_points = []
-            for _st in self.strides:
-                st_points = []
-                for (st, (j, i), (cx, cy)), [gt_box, loss] in c3_assignments.items():
-                    if st == _st:
-                        st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
-                c3_points.append(st_points)
+            if not inside.any():
+                # Empty
+                labels_per_stride.append(torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device))
+                pos_per_stride.append(torch.empty((0,2), device=device, dtype=torch.long))
+                if debug:
+                    C1_points_by_st.append([])
+                    C2_points_by_st.append([])
+                    C3_points_by_st.append([])
+                    FINAL_points_by_st.append([])
+                continue
 
-            final_points = []
-            for _st in self.strides:
-                st_points = []
-                for (st, (j, i)), [(cx, cy), (gt_box, loss)] in final_assignments.items():
-                    if st == _st:
-                        st_points.append([cx, cy, box_and_color[tuple(gt_box.tolist())]])
-                final_points.append(st_points)
+            gt_id, ii, jj = inside.nonzero(as_tuple=True)   # [N_cand]
+            N = gt_id.numel()
+            lin = (ii * W + jj)         # [N]
+            anc_cx = CX[gt_id, ii, jj]  # [N]
+            anc_cy = CY[gt_id, ii, jj]  # [N]
 
-            points_and_strides = [c1_points, c2_points, c3_points, final_points]
+            # Selected Grids Features [4*regmax+nc,N]
+            C = p.shape[0]
+            pred_flat = p.reshape(C, -1)    # [4*regmax+nc, H*W]
+            pred_cand = pred_flat.index_select(1, lin)  # [4*regmax+nc, N]
 
-            return labels, positive_anchors, points_and_strides
+            # CLA
+            # cls Loss
+            pred_cls = pred_cand[4*self.regmax:, :].T                 # [N,nc]
+            tgt_cls = torch.nn.functional.one_hot(gt_boxes[gt_id,0].long(), self.nc).to(torch.float32)  # [N,nc]
+            Lcls = torchvision.ops.sigmoid_focal_loss(pred_cls, tgt_cls, reduction='none').sum(1)       # [N]
 
-        return labels, positive_anchors, None
+            # reg → ltrb (0..1 norm)
+            pred_reg = pred_cand[:4*self.regmax, :].reshape(4, self.regmax, N)
+            pred_reg = torch.softmax(pred_reg, dim=1)
+            ltrb = (pred_reg * self.proj).sum(1)*(st / self.imgsz)       # [4,N]
+            l, t, r, b = ltrb[0], ltrb[1], ltrb[2], ltrb[3]            # [N]
 
-    def __candidate3(self, assignments: dict, k: int=20):
-        """
-        Select best k anchor points for each stride from c2_assignments
+            # pred boxes (norm)
+            px1 = anc_cx - l
+            py1 = anc_cy - t
+            px2 = anc_cx + r
+            py2 = anc_cy + b
+            pred_xyxy = torch.stack([px1,py1,px2,py2], dim=1)         # [N,4]
 
-        Args:
-            assignments (defaultdict(list)): c2_assignments
+            # gt boxes (norm)
+            gt_xyxy = torchvision.ops.box_convert(gt_boxes[gt_id,1:], 'cxcywh', 'xyxy')  # [N,4]
 
-        Returns:
-            c3_assignments (defaultdict(list)): Selected k anchor points for each stride from c2_assignments
-            avg_loss (float): average of its losses
-        """
-        # c2[(st, (j, i), (cx, cy))] = [(box, loss)]
+            # Lreg = GIoU (LADA paper: GIoU)
+            Lreg = torchvision.ops.generalized_box_iou_loss(pred_xyxy, gt_xyxy, reduction='none')  # [N]
 
-        c3 = defaultdict(list)
-        losses = []
-        for st in self.strides:
-            stride_group = []
-            for (_st, (j, i), (cx, cy)), [box, loss] in assignments.items():
-                if _st == st:
-                    stride_group.append(((_st, (j, i), (cx, cy)), [box, loss]))
+            # dev
+            gx1, gy1, gx2, gy2 = gt_xyxy.unbind(1)
+            dev_h = (torch.abs((anc_cx - gx1) - (gx2 - anc_cx)) / ( (anc_cx - gx1) + (gx2 - anc_cx) + 1e-9 ))
+            dev_v = (torch.abs((anc_cy - gy1) - (gy2 - anc_cy)) / ( (anc_cy - gy1) + (gy2 - anc_cy) + 1e-9 ))
+            dev = torch.clamp(dev_h + dev_v - 1.0, min=0.0)           # [N], <=1 → 0, >1 → dev-1
 
-            end = min(k, len(stride_group))
-            stride_group = sorted(stride_group, key=lambda x:x[1][1])
-            
-            for (_st, (j, i), (cx, cy)), [box, loss] in stride_group[:end]:
-                c3[(_st, (j, i), (cx, cy))] = [box, loss]
-                losses.append(loss)
+            loss = Lcls + 1.5*Lreg + dev                              # [N]
 
-        avg_loss = sum(losses)/(len(losses)+1e-6)
+            # Best N candidates
+            # lin: [N], loss: [N]  → lin based min loss
+            min_loss = torch.full((H*W,), float('inf'), device=device)
+            min_loss = min_loss.scatter_reduce(0, lin, loss, reduce='amin', include_self=True)  # [H*W]
+            mask = loss <= (min_loss[lin] + 1e-12)
+            sel = torch.nonzero(mask, as_tuple=False).squeeze(1)      # [H*W] eleman
+            # guarenteed for each (i,j): only one gt
+            order = torch.argsort(lin[sel])
+            sel = sel[order]
+            lin_sel = lin[sel]
+            keep = torch.ones_like(lin_sel, dtype=torch.bool)
+            keep[1:] = lin_sel[1:] != lin_sel[:-1]
+            sel = sel[keep]
 
-        return c3, avg_loss
+            # C1:
+            c1_i = ii[sel]; c1_j = jj[sel]; c1_lin = lin[sel]
+            c1_cx = anc_cx[sel]; c1_cy = anc_cy[sel]
+            c1_gtid = gt_id[sel]; c1_loss = loss[sel]                 # [M]
 
-    def __candidate2(self, c1_assignments: dict, gt_boxes: torch.Tensor, k: int=9):
-        """
-        Select best k anchor points for each gtbox for each stride from c1_assignments
-
-        Args:
-            assignments (defaultdict(list)): c1_assignments
-            gt_boxes (torch.Tensor): ground truth boxes
-            k (int, optional): Number of point for each gt_box for each stride. Default is 9.
-
-        Returns:
-            c2_assignments (defaultdict(list)): selected best k anchor points for each gt_box for each stride from c1_assignments
-        """
-        # c1[(st, (j, i), (cx, cy))] = [best_box, best_loss]
-        # select best k for each stride
-
-        c2 = defaultdict(list)
-                
-        for st in self.strides:
-            for box in gt_boxes:
-                boxes_groups = []
-                for (_st, (j, i), (cx, cy)), [_box, loss] in c1_assignments.items():
-                    if _st == st and _box.tolist() == box.tolist():
-                        boxes_groups.append(((_st, (j, i), (cx, cy)), (box, loss)))
-
-                end = min(k, len(boxes_groups))
-                sorted_boxes_groups = sorted(boxes_groups, key=lambda x: x[1][1])
-                for (_st, (j, i), (cx, cy)), (box, loss) in sorted_boxes_groups[:end]:
-                    c2[(st, (j, i), (cx, cy))] = [box, loss]
-                    
-        return c2
-
-    def __candidate1(self, gt_boxes:torch.Tensor, preds:list[torch.Tensor]):
-        """
-        Creates EPCP targets with LADA Assignment Algorithm https://doi.org/10.3390/s23146306 3.1. Equally Proportional Center Prior
-
-        Args:
-            gt_boxes (torch.Tensor): ground truth boxes shaped like (n,5) (cls_id,cx,cy,w,h), normalized[0-1]
-            preds (list[torch.Tensor]): (..,p3,p4,p5,..) predictions [1,4*regmax+nc,H,W]
-
-        Returns:
-            assignments (defaultdict(list)): EPCP/C1 targets for each stride
-        """
-        # gt_boxes = [n,5], box format (cls_id,cx,cy,w,h), normalized[0-1]
-        # preds = [[1,4*regmax+nc,p3,p3],[1,4*regmax+nc,p4,p4],[1,4*regmax+nc,p5,p5]]
-
-        assignments = defaultdict(list) # [st, grid_point, normalized_point, [gt, loss]]
-        def EPCP(s, gt):
-            # gt: [cls,cx,cy,w,h] (norm)
-            r = math.sqrt(s/max(self.strides))
-            pa = torchvision.ops.box_convert(
-                torch.tensor([gt[1], gt[2], gt[3]*r, gt[4]*r], dtype=torch.float32, device=self.device),
-                'cxcywh', 'xyxy').clamp(0, 1)
-            return pa
-        
-        # Grid assignment
-        for st in self.strides:
-            for box in gt_boxes:
-                pa = EPCP(st, box) # GT Box positive area xyxy, EPCP
-                i0 = int(torch.floor(pa[1]*self.imgsz/st))
-                j0 = int(torch.floor(pa[0]*self.imgsz/st))
-                i1 = int(torch.ceil(pa[3]*self.imgsz/st))
-                j1 = int(torch.ceil(pa[2]*self.imgsz/st))
-                for i in range(i0, i1):
-                    for j in range(j0, j1):
-                        cx = (j+0.5)*st/self.imgsz
-                        cy = (i+0.5)*st/self.imgsz
-                        if (pa[0].item() < cx < pa[2].item()) and (pa[1].item() < cy < pa[3].item()): # Check grid cell if in positive area
-                            assignments[(st, (j, i), (cx, cy))].append((box)) # Assign to grid cell         
-
-        # Loss assignment
-        c1 = defaultdict(list)
-        for pred in preds:
-            _st = self.imgsz//pred.shape[-1]
-            for (st, (j, i), (cx, cy)), boxes in assignments.items():
-                if st == _st:
-                    best_box = None
-                    best_loss = float('inf')
-                    for box in boxes:
-                        loss = self.CLA(pred[:, i, j], box, (cx,cy), st)
-                        if loss < best_loss:
-                            best_loss = loss
-                            best_box = box
-                    c1[(st, (j, i), (cx, cy))] = [best_box, best_loss]
-        
-        return c1
-       
-    def CLA(self, pred:torch.Tensor, gt:torch.Tensor, anchor_point:tuple[int,int], stride:int):
-        """
-        Calculates anchor loss to LADA Assignment Algorithm https://doi.org/10.3390/s23146306 3.2. Combined Loss of Anchor\\
-        This funciton calculates combined loss of anchor\\
-        CLA = Lcls+ λ1*Lreg + λ2*Ldev | λ1:1.5, λ2:1\\
-        Lcls = FocalLoss(pcls , g)\\
-        Lreg = CIoULoss(preg , g)\\ !**paper used GIoULoss**!\\
-        Ldev = |l − r|/(l+r) + |t − b|/(t+b) is anchor point deviation from ground truth
-
-        Args:
-            pred (torch.Tensor): prediction tensor shaped like [4*regmax+nc]
-            gt (torch.Tensor): ground truth tensor shaped like [1+4] (nc, cx, cy, w, h)
-            anchor_point (tuple[int,int]): anchor point (cx,cy), normalized [0-1]
-            stride (int): stride
-
-        Returns:
-            loss (torch.Tensor): loss"""
-        # Combined Loss of Anchors
-        # pred = 4*regmax+nc , gt = 4+1
-        # CLA = Lcls+ λ1*Lreg + λ2*Ldev | λ1:1.5, λ2:1 accorting to paper https://doi.org/10.3390/s23146306
-        # Lcls = FocalLoss(pclsj , gi)
-        # Lreg = CIoULoss(pregj , gi)
-        # Ldev = |l − r|/(l+r) + |t − b|(t+b)
-        
-        def dev(anchor_point:tuple, gt:torch.Tensor, stride:int, imgsz:int):
-            cx = anchor_point[0]
-            cy = anchor_point[1]
-            box_xyxy = torchvision.ops.box_convert(gt[1:], 'cxcywh', 'xyxy')
-            l = cx - box_xyxy[0]
-            t = cy - box_xyxy[1]
-            r = box_xyxy[2] - cx
-            b = box_xyxy[3] - cy
-            hdev = abs(l - r) / (l + r)
-            vdev = abs(t - b) / (t + b)
-            dev = hdev + vdev
-            if 0<=dev.item()<=1: return 0
-            elif 1<dev.item(): return dev - 1
-
-        pred_classes = pred[self.regmax*4:]
-        gt_classes = torch.nn.functional.one_hot(gt[0].long(), num_classes=self.nc).to(torch.float32)
-
-        pred_reg = pred[:self.regmax*4].reshape(4, self.regmax).softmax(dim=1)
-        
-        ltrb = torch.sum(pred_reg*self.proj.squeeze(-1), dim=1)*stride/self.imgsz
-        xyxy_pred = torch.tensor([
-            anchor_point[0]-ltrb[0], 
-            anchor_point[1]-ltrb[1], 
-            anchor_point[0]+ltrb[2], 
-            anchor_point[1]+ltrb[3]], 
-            device=ltrb.device)
-        xyxy_gt = torchvision.ops.box_convert(gt[1:], 'cxcywh', 'xyxy')
-        Lreg = torchvision.ops.ciou_loss.complete_box_iou_loss(xyxy_pred, xyxy_gt, reduction="sum")
-        Lcls = torchvision.ops.focal_loss.sigmoid_focal_loss(pred_classes, gt_classes, alpha=0.25, gamma=2, reduction="sum")
-        Ldev = dev(anchor_point, gt, stride, self.imgsz)
-        loss = Lcls + 1.5*Lreg + Ldev
-        # print(f"Lcls = {Lcls}, Lreg = {Lreg}, Ldev = {Ldev}, CLA = {loss}")
-        # print("pred_reg :", pred)
-        # print("ltrb :", ltrb)
-        # print("xyxy_pred raw :", xyxy_pred)
-        # print("xyxy_gt :", xyxy_gt)
-        # w = xyxy_pred[2] - xyxy_pred[0]
-        # h = xyxy_pred[3] - xyxy_pred[1]
-        # print("w,h =", w.item(), h.item())
-        return loss
-            
-    def distribute(self, l: torch.Tensor, t: torch.Tensor, r: torch.Tensor, b: torch.Tensor):
-        """
-        Distributes l, t, r, b to regmax bins
-
-        Args:
-            l (torch.Tensor): left
-            t (torch.Tensor): top
-            r (torch.Tensor): right
-            b (torch.Tensor): bottom
-
-        Returns:
-            torch.Tensor: distributed l, t, r, b
-
-        Examples:
-            >>> regmax = 4
-            >>> a, b, c, d = torch.tensor([0.4, 0.2, 1.3, 0.4])
-            >>> dist(a)
-            tensor([0.6000, 0.4000, 0.0000, 0.0000])
-            >>> dist(c)
-            tensor([0.0000, 0.7000, 0.3000, 0.0000])
-        """
-        # Distribute loss
-        def dist(val:torch.Tensor):
-            v = torch.clamp(val, 0, self.regmax-1-10e-4)
-            left = int(torch.floor(v).item())
-            right = left + 1
-            label = torch.zeros(self.regmax, device=val.device)
-            if right >= self.regmax:
-                label[left] = 1.0
+            if debug:
+                pts = []
+                for _i, _j, _cx, _cy, _gid in zip(c1_i.tolist(), c1_j.tolist(), c1_cx.tolist(), c1_cy.tolist(), c1_gtid.tolist()):
+                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
+                C1_points_by_st.append(pts)
             else:
-                label[left]  = right - v.item()
-                label[right] = v.item() - left
-            return label
-        
-        return torch.cat([dist(l), dist(t), dist(r), dist(b)], dim=0)
-    
-    def batch_eval(self, pred_boxes: list[torch.Tensor], gt_boxes:list[torch.Tensor]):
+                C1_points_by_st.append([])
+
+            # C2: top-k for each gt
+            if c1_gtid.numel() == 0:
+                if debug:
+                    C2_points_by_st.append([])
+                else:
+                    C2_points_by_st.append([])
+                # Protect C3
+                c3_candidates_per_st[st] = {
+                    "i": torch.empty(0, dtype=torch.long, device=device),
+                    "j": torch.empty(0, dtype=torch.long, device=device),
+                    "cx": torch.empty(0, device=device),
+                    "cy": torch.empty(0, device=device),
+                    "gtid": torch.empty(0, dtype=torch.long, device=device),
+                    "loss": torch.empty(0, device=device)
+                }
+                continue
+
+            sel_list = []
+            for g in range(G):
+                m = (c1_gtid == g)  # Bool Tensor [M]
+                if not m.any(): # İf not include True
+                    continue
+                l = c1_loss[m]  # 
+                kk = min(c2k, l.numel())
+                topk_idx = torch.topk(l, k=kk, largest=False).indices
+                idx_global = torch.nonzero(m, as_tuple=False).squeeze(1)[topk_idx]
+                sel_list.append(idx_global)
+            if len(sel_list) > 0:
+                c2_idx = torch.cat(sel_list, 0)
+            else:
+                c2_idx = torch.empty(0, dtype=torch.long, device=device)
+
+            c2_i = c1_i[c2_idx]; c2_j = c1_j[c2_idx]
+            c2_cx = c1_cx[c2_idx]; c2_cy = c1_cy[c2_idx]
+            c2_gtid = c1_gtid[c2_idx]; c2_loss = c1_loss[c2_idx]
+
+            if debug:
+                pts = []
+                for _i, _j, _cx, _cy, _gid in zip(c2_i.tolist(), c2_j.tolist(), c2_cx.tolist(), c2_cy.tolist(), c2_gtid.tolist()):
+                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
+                C2_points_by_st.append(pts)
+            else:
+                C2_points_by_st.append([])
+
+            # C3 stride top-k
+            if c2_loss.numel() > 0:
+                kk3 = min(c3k, c2_loss.numel())
+                c3_take = torch.topk(c2_loss, k=kk3, largest=False).indices
+                c3_i = c2_i[c3_take]; c3_j = c2_j[c3_take]
+                c3_cx = c2_cx[c3_take]; c3_cy = c2_cy[c3_take]
+                c3_gtid = c2_gtid[c3_take]; c3_loss = c2_loss[c3_take]
+            else:
+                c3_i = torch.empty(0, dtype=torch.long, device=device)
+                c3_j = torch.empty(0, dtype=torch.long, device=device)
+                c3_cx = torch.empty(0, device=device)
+                c3_cy = torch.empty(0, device=device)
+                c3_gtid = torch.empty(0, dtype=torch.long, device=device)
+                c3_loss = torch.empty(0, device=device)
+
+            c3_candidates_per_st[st] = {
+                "i": c3_i, "j": c3_j, "cx": c3_cx, "cy": c3_cy, "gtid": c3_gtid, "loss": c3_loss
+            }
+            all_losses_for_dlt.append(c3_loss)
+
+            if debug:
+                pts = []
+                for _i, _j, _cx, _cy, _gid in zip(c3_i.tolist(), c3_j.tolist(), c3_cx.tolist(), c3_cy.tolist(), c3_gtid.tolist()):
+                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
+                C3_points_by_st.append(pts)
+            else:
+                C3_points_by_st.append([])
+
+        # DLT
+        if len(all_losses_for_dlt) > 0:
+            all_losses = torch.cat([x for x in all_losses_for_dlt if x.numel() > 0], 0)
+            avg_loss = (all_losses.mean().item() if all_losses.numel() > 0 else float('inf'))
+        else:
+            avg_loss = float('inf')
+
+        # Fianl
+        for p in preds:
+            st = self.imgsz // p.shape[-1]
+            H = self.grid_cache[st]["H"]; W = self.grid_cache[st]["W"]
+            cand = c3_candidates_per_st.get(st, None)
+            if cand is None or cand["i"].numel() == 0:
+                labels_per_stride.append(torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device))
+                pos_per_stride.append(torch.empty((0,2), device=device, dtype=torch.long))
+                if debug:
+                    FINAL_points_by_st.append([])
+                continue
+
+            # DLT filter
+            keep = cand["loss"] < avg_loss
+            i_fin = cand["i"][keep]; j_fin = cand["j"][keep]
+            cx_fin = cand["cx"][keep]; cy_fin = cand["cy"][keep]
+            gid_fin = cand["gtid"][keep]
+            n_fin = i_fin.numel()
+
+            # label map
+            L = torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device)  # [1,C,H,W]
+
+            if n_fin > 0:
+                # ltrb dist
+                gt_sel = gt_boxes[gid_fin] # [N,5]
+                xyxy = torchvision.ops.box_convert(gt_sel[:,1:], 'cxcywh','xyxy')  # [N,4]
+                x1,y1,x2,y2 = xyxy.unbind(1)
+                scale = self.imgsz / st
+                l = (cx_fin - x1) * scale
+                t = (cy_fin - y1) * scale
+                r = (x2 - cx_fin) * scale
+                b = (y2 - cy_fin) * scale
+                dist_ltrb = self._distribute_vec(torch.stack([l,t,r,b], dim=1), self.regmax)  # [N,4*regmax]
+
+                cls_onehot = torch.nn.functional.one_hot(gt_sel[:,0].long(), self.nc).to(torch.float32)  # [N,nc]
+                label_vec = torch.cat([dist_ltrb, cls_onehot], dim=1)  # [N, 4*regmax+nc]
+
+                # scatter to [1,C,H*W]
+                lin_fin = (i_fin * W + j_fin)  # [N]
+                L2 = L.view(1, -1, H*W)[0]     # [C,H*W]
+                L2[:, lin_fin] = label_vec.T
+
+            labels_per_stride.append(L)
+            pos_per_stride.append(torch.stack([i_fin, j_fin], dim=1) if n_fin>0 else torch.empty((0,2), device=device, dtype=torch.long))
+
+            if debug:
+                pts = []
+                for _cx, _cy, _gid in zip(cx_fin.tolist(), cy_fin.tolist(), gid_fin.tolist()):
+                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
+                FINAL_points_by_st.append(pts)
+
+        points_and_strides = [C1_points_by_st, C2_points_by_st, C3_points_by_st, FINAL_points_by_st] if debug else None
+        return labels_per_stride, pos_per_stride, points_and_strides
+
+    @staticmethod
+    def _distribute_vec(ltrb_pix: torch.Tensor, regmax: int) -> torch.Tensor:
+        """
+        DFL Distribution
+        ltrb_pix: [N,4] (float, 0..∞), softmaxed output of regressors bins (regmax)
+        """
+        v = torch.clamp(ltrb_pix, 0, regmax-1-1e-4)              # [N,4]
+        left = torch.floor(v).to(torch.long)                     # [N,4]
+        right = torch.clamp(left + 1, max=regmax-1)              # [N,4]
+        w_right = (v - left.to(v.dtype))                         # [N,4]
+        w_left  = 1.0 - w_right                                  # [N,4]
+
+        N = v.shape[0]
+        out = v.new_zeros((N, 4, regmax))                        # [N,4,R]
+        out.scatter_(2, left.unsqueeze(-1), w_left.unsqueeze(-1))
+        out.scatter_(2, right.unsqueeze(-1), w_right.unsqueeze(-1))
+        return out.view(N, 4*regmax)                             # [N,4R]
+
+    def batch_eval(self, pred_boxes: List[torch.Tensor], gt_boxes: List[torch.Tensor]):
         # pred_boxes is [[N, 6],...] xyxy, cls_score, cls_id
-        # gt_boxes is [[N, 5],...] cls_id, xyxy
+        # gt_boxes is [[N, 5],...] cls_id, cxcywh (norm)
         batch_pred_dicts = []
         batch_target_dicts = []
 
         for pboxes in pred_boxes:
             # pboxes.shape is [N,6]
-            xyxy = pboxes[:, :4] # [N, 4]
-            scores = pboxes[:, 4] # [N]
-            cls = pboxes[:, 5] # [N]
-
-            if xyxy.shape[0] == 0:
+            if pboxes.numel() == 0:
                 batch_pred_dicts.append({"boxes": torch.zeros((0, 4), device=self.device),
-                                    "scores": torch.zeros((0,), device=self.device),
-                                    "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
+                                         "scores": torch.zeros((0,), device=self.device),
+                                         "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
             else:
+                xyxy = pboxes[:, :4]   # [N,4]
+                scores = pboxes[:, 4]  # [N]
+                cls = pboxes[:, 5]     # [N]
                 batch_pred_dicts.append({"boxes": xyxy,
-                                    "scores": scores,
-                                    "labels": cls.long()})
+                                         "scores": scores,
+                                         "labels": cls.long()})
+
         for tboxes in gt_boxes:
-            # gboxes.shape is [N,5]
             if tboxes.numel() == 0:
                 batch_target_dicts.append({"boxes": torch.zeros((0, 4), device=self.device),
-                                    "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
+                                           "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
             else:
-                    
-                xyxy = torchvision.ops.box_convert(tboxes[:, 1:]*self.imgsz, "cxcywh", "xyxy") # [N, 4]
-                cls = tboxes[:, 0] # [N]
-
+                xyxy = torchvision.ops.box_convert(tboxes[:, 1:]*self.imgsz, "cxcywh", "xyxy")
+                cls = tboxes[:, 0]
                 batch_target_dicts.append({"boxes": xyxy,
-                                    "labels": cls.long()})
-                
-        return batch_pred_dicts, batch_target_dicts
+                                           "labels": cls.long()})
 
-            
-        
+        return batch_pred_dicts, batch_target_dicts

@@ -21,7 +21,7 @@ class Postprocess(torch.nn.Module):
         xyxy, scores = torch.split(x, (4, x.shape[2]-4), dim=2) # xyxy.shape is (B, N, 4), cls.shape is (B,N, nc)
 
         score_vals, cls_ids = scores.max(2) # score_vals.shape is (B,N), cls_ids.shape is (B,N)
-        mask = score_vals > torch.mean(score_vals) + torch.std(score_vals) if self.score_thres is None else score_vals > self.score_thres  # mask.shape is (B,N)
+        mask = score_vals > 0.25 if self.score_thres is None else score_vals > self.score_thres  # mask.shape is (B,N)
 
         out = []
 
