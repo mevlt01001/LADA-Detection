@@ -61,6 +61,7 @@ class HybridBody(torch.nn.Module):
         self.grid_sizes = [f.shape[-1] for f in out]
 
         self.regmax = max(3, int(min(self.grid_sizes)-min(self.grid_sizes)//8)) if regmax is None else regmax
+        del dummy, out
         print(self)
 
     def __str__(self):

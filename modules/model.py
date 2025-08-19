@@ -38,8 +38,7 @@ class Model(torch.nn.Module):
                  names:list=None
                 ):
         
-        super().__init__()
-        print(imgsz)
+        super().__init__()        
         self.imgsz = max(64, 32*(int(imgsz)//32))
         self.nc = nc
         self.cls_names = names
@@ -57,8 +56,6 @@ class Model(torch.nn.Module):
     @classmethod
     def from_ckpt(cls, checkpoint_path:os.PathLike, device=torch.device("cpu")):
         ckpt = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
-        print(ckpt.keys())
-        print(ckpt["models"])
 
         inst = cls(
             models=[YOLO(model) if 'yolo' in model else RTDETR(model) for model in ckpt["models"]],

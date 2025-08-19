@@ -48,11 +48,18 @@ def debug_visualize(image: torch.Tensor,
     image = np.ascontiguousarray((image.permute(1,2,0)*255).to(device="cpu", dtype=torch.uint8).numpy())
     img2 = image.copy()
     if gt_boxes.shape[0] > 0:
-        _, cx, cy, w, h = torch.unbind(gt_boxes*imgsz, dim=1)
-        boxes = torch.stack((cx-w/2, cy-h/2, cx+w/2, cy+h/2), dim=1).tolist()
-        for box in boxes:
+
+        cls_idx, cxcywh = torch.split(gt_boxes, [1,4], dim=1)
+        cx, cy, w, h = torch.unbind(cxcywh*imgsz, dim=1)
+        boxes = torch.stack((cx-w/2, cy-h/2, cx+w/2, cy+h/2), dim=1)
+
+        for box, idx in zip(boxes, cls_idx.long()):
             x1, y1, x2, y2 = map(int, box)
+            label = names[int(idx)]
             image = cv2.rectangle(image, (x1, y1), (x2, y2), (0,255,0), 1)
+            w,h = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            image = cv2.rectangle(image, (x1, y1), (int(x1+w), int(y1-h-10)), (0,255,0), cv2.FILLED)
+            image = cv2.putText(image, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
     frames = np.zeros((imgsz*len(strides), imgsz*4, 3), dtype=np.uint8)
 
@@ -89,8 +96,10 @@ def debug_visualize(image: torch.Tensor,
 
         x1, y1, x2, y2 = map(int, xyxy)
         cv2.rectangle(img2, (x1, y1), (x2, y2), (0,0,255), 2)
-        label = f"cls:{names[cls_id.item()]} score:{cls_score.item():.2f}"
-        img2 = cv2.putText(img2, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+        label = f"{names[cls_id.item()]} {cls_score.item():.2f}"
+        w, h = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        img2 = cv2.rectangle(img2, (x1, y1), (int(x1+w), int(y1-h-10)), (0,0,255), cv2.FILLED)
+        img2 = cv2.putText(img2, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
     # frames[:imgsz, imgsz*4:imgsz, :] = img2
 
     frames = cv2.resize(frames, (ratio*4, ratio*len(strides)))
@@ -184,8 +193,10 @@ class LADATrainer:
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
         valid_names = None if valid_path is None else np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images")))))
 
-        if self.last_ep/epoch > 0.95:
+        if self.last_ep/epoch > 0.99:
             self.last_ep = 0
+            self.last_batch = 0
+
         if len(train_names) > 0 and self.last_batch/len(train_names) > 0.95:
             self.last_batch = 0
             self.last_ep += 1
@@ -195,9 +206,9 @@ class LADATrainer:
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=0.008,
+            optimizer, max_lr=0.01,
             epochs=max(1, epoch - self.last_ep),
-            steps_per_epoch=math.ceil(len(train_names)/max(1,batch))
+            steps_per_epoch=math.ceil(len(train_names)/batch)
         )
         if self.sched_state_dict is not None:
             scheduler.load_state_dict(self.sched_state_dict)
@@ -206,7 +217,6 @@ class LADATrainer:
             losses = []
             last_batch = self.last_batch
             for i in range(last_batch, len(train_names), batch):
-                # NOT calling empty_cache() here on purpose (big slowdown).
                 batch_size = batch if i+batch < len(train_names) else len(train_names)-i
                 optimizer.zero_grad(set_to_none=True)
 
@@ -250,32 +260,31 @@ class LADATrainer:
                              mAP_50_95=map50_95,
                              val=False
                              )
-
-                # checkpoint (eval=False → BN/statics don’t move)
-                model = model.train(False)
-                torch.save({
-                    "models": self.model.backbone.model_names,
-                    "nc": self.nc,
-                    "cls_names": self.cls_names,
-                    "imgsz": self.imgsz,
-                    "regmax": self.regmax,
-                    "model_state_dict": model.state_dict(),
-                    "optim_state_dict": optimizer.state_dict(),
-                    "sched_state_dict": scheduler.state_dict(),
-                    "last_epoch": ep,
-                    "last_batch": i+batch
-                    }, f"LADA_Last.pt")
-                model = model.train(True)
+                
 
             print(f" AvgLoss={sum(losses)/(len(losses)+1e-5):<6.4f}\n")
             self.map_metric.reset()
+            torch.save({
+                        "models": self.model.backbone.model_names,
+                        "nc": self.nc,
+                        "cls_names": self.cls_names,
+                        "imgsz": self.imgsz,
+                        "regmax": self.regmax,
+                        "model_state_dict": model.state_dict(),
+                        "optim_state_dict": optimizer.state_dict(),
+                        "sched_state_dict": scheduler.state_dict(),
+                        "last_epoch": ep,
+                        "last_batch": i+batch
+                        }, f"LADA_{i+batch}.pt")
+
 
             # validation
-            batch_eval_size = int(batch*2)
+            batch_eval_size = int(batch*1)
             if valid_path is not None and len(valid_names) > 0:
                 with torch.inference_mode():
                     model = model.train(False)
                     for i in range(0, len(valid_names), batch_eval_size):
+                        torch.cuda.empty_cache()
                         batch_size = batch_eval_size if i+batch_eval_size < len(valid_names) else len(valid_names)-i
                         images, gt_boxes = self.__load_data(valid_names[i:batch_size+i], valid_path)
                         pred_boxes = model.forward(images) # [B,4+nc,N]
@@ -315,12 +324,12 @@ class LADATrainer:
             images.append(image)
             bboxes.append(bbox)
 
-        return torch.cat(images, dim=0), bboxes
+        return torch.stack(images, dim=0), bboxes
 
     def __load_image(self, path: str):
-        img = torch.from_numpy(np.array(Image.open(path+".jpg").convert("RGB"))).to(device=self.device)
-        assert img.ndim == 3, f"Image({path}.jpg) must have 3 dimensions"
-        img = self.__preprocess(img)
+        img = np.array(Image.open(path+".jpg").convert("RGB").resize((self.imgsz, self.imgsz)))
+        img = np.transpose(img, (2, 0, 1))/255.0 # HWC -> CHW        
+        img = torch.from_numpy(img).to(device=self.device, dtype=torch.float32)
         return img
 
     def __load_gt_boxes(self, path: str):

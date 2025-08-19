@@ -34,7 +34,12 @@ class DFL(torch.nn.Module):
             st, repeat = self.imgsz//gs, gs**2            
             strides.extend([st]*repeat)
         self.strides = torch.tensor(strides, device=device)
+        self.centers = [
+            torch.meshgrid(torch.arange(gs), torch.arange(gs), indexing='xy')
+            for gs in self.grid_sizes
+        ]
 
+    @torch.no_grad()
     def forward(self, x:list[torch.Tensor]):
         """
         Args:
@@ -58,13 +63,8 @@ class DFL(torch.nn.Module):
         """
         # x = [[1,4*regmax+nc,8k,8k], [1,4*regmax+nc,4k,4k], [1,4*regmax+nc,2k,2k], ...]
 
-        centers = [
-            torch.meshgrid(torch.arange(gs), torch.arange(gs), indexing='xy')
-            for gs in self.grid_sizes
-        ]
-
-        gx = [(c[0].float()+0.5).reshape(-1) for c in centers]
-        gy = [(c[1].float()+0.5).reshape(-1) for c in centers]
+        gx = [(c[0].float()+0.5).reshape(-1) for c in self.centers]
+        gy = [(c[1].float()+0.5).reshape(-1) for c in self.centers]
 
         gx = torch.cat(gx, dim=0).to(x[0].device)*self.strides
         gy = torch.cat(gy, dim=0).to(x[0].device)*self.strides
