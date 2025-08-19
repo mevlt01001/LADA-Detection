@@ -487,139 +487,124 @@ class LADATrainer:
                                 c2k: int,
                                 c3k: int):
         """
-        C1: EPCP area candiadates
+        C1: EPCP area candidates
         C2: top-k candidates for each gt for each stride
-        C3: top-k candidates for each gt
-        Final: cC3 candidates > avg_loss(C3)
+        C3: top-k candidates for each gt (across all strides)
+        Final: C3 ∩ (loss < avg_loss(C3))  [DLT per-GT]
         """
-        G = gt_boxes.shape[0]
         device = self.device
-        C1_points_by_st = []
-        C2_points_by_st = []
-        C3_points_by_st = []
-        FINAL_points_by_st = []
+        G = gt_boxes.shape[0]
 
-        # Collect all labels and positive anchors
+        # stride index map
+        st2idx = {st: i for i, st in enumerate(self.strides)}
+
+        C1_points_by_st = [[] for _ in self.strides]
+        C2_points_by_st = [[] for _ in self.strides]
+        C3_points_by_st = [[] for _ in self.strides]
+        FINAL_points_by_st = [[] for _ in self.strides]
+
+
         labels_per_stride: List[torch.Tensor] = []
         pos_per_stride: List[torch.Tensor] = []
-        all_losses_for_dlt = []
 
-        c3_candidates_per_st = {}
+        c2_candidates_per_st: dict[int, dict[str, torch.Tensor]] = {}
 
         color_map = {}
         if debug:
             for gb in gt_boxes:
                 color_map[tuple(gb.tolist())] = np.random.randint(0, 255, 3).tolist()
 
-        for p in preds: # [[4*regmax+nc, H, W] for each stride]
-            # p.shape = [4*regmax+nc, H, W]
+        # C1 and C2: stride-based, C3: across all strides
+        # 1) Collect C2 for each stride
+        for p in preds:  # p: [4*regmax+nc, H, W]
             st = self.imgsz // p.shape[-1]
             cache = self.grid_cache[st]
             H, W = cache["H"], cache["W"]
-            cx_map, cy_map = cache["cx"], cache["cy"]        # [H,W]
-            # EPCP (G,4) (xyxy, norm)
+            cx_map, cy_map = cache["cx"], cache["cy"]  # [H,W]
+
+            # EPCP alanı (G,4) (xyxy, norm)
             r = math.sqrt(st / self.max_stride)
             pa_xyxy = torchvision.ops.box_convert(
-                torch.stack([gt_boxes[:,1], gt_boxes[:,2], gt_boxes[:,3]*r, gt_boxes[:,4]*r], dim=1),
+                torch.stack([gt_boxes[:, 1], gt_boxes[:, 2],
+                            gt_boxes[:, 3]*r, gt_boxes[:, 4]*r], dim=1),
                 'cxcywh', 'xyxy'
             ).clamp_(0, 1)  # [G,4]
 
             # [1,H,W] → [G,H,W]
             CX = cx_map.unsqueeze(0).expand(G, H, W)
             CY = cy_map.unsqueeze(0).expand(G, H, W)
-            x1,y1,x2,y2 = pa_xyxy[:,0].view(G,1,1), pa_xyxy[:,1].view(G,1,1), pa_xyxy[:,2].view(G,1,1), pa_xyxy[:,3].view(G,1,1)
-            inside = (CX > x1) & (CX < x2) & (CY > y1) & (CY < y2)    # [G,H,W]
+            x1, y1, x2, y2 = [pa_xyxy[:, k].view(G, 1, 1) for k in range(4)]
+            inside = (CX > x1) & (CX < x2) & (CY > y1) & (CY < y2)  # [G,H,W]
+
+            # stride index
+            sidx = st2idx[st]
 
             if not inside.any():
-                # Empty
-                labels_per_stride.append(torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device))
-                pos_per_stride.append(torch.empty((0,2), device=device, dtype=torch.long))
-                if debug:
-                    C1_points_by_st.append([])
-                    C2_points_by_st.append([])
-                    C3_points_by_st.append([])
-                    FINAL_points_by_st.append([])
+                c2_candidates_per_st[st] = {
+                    "i": torch.empty(0, dtype=torch.long, device=device),
+                    "j": torch.empty(0, dtype=torch.long, device=device),
+                    "cx": torch.empty(0, device=device),
+                    "cy": torch.empty(0, device=device),
+                    "gtid": torch.empty(0, dtype=torch.long, device=device),
+                    "loss": torch.empty(0, device=device)
+                }
                 continue
 
-            gt_id, ii, jj = inside.nonzero(as_tuple=True)   # [N_cand]
-            N = gt_id.numel()
-            lin = (ii * W + jj)         # [N]
-            anc_cx = CX[gt_id, ii, jj]  # [N]
-            anc_cy = CY[gt_id, ii, jj]  # [N]
+            gt_id, ii, jj = inside.nonzero(as_tuple=True)  # [N_cand]
+            lin = (ii * W + jj)                            # [N]
+            anc_cx = CX[gt_id, ii, jj]
+            anc_cy = CY[gt_id, ii, jj]
 
-            # Selected Grids Features [4*regmax+nc,N]
             C = p.shape[0]
-            pred_flat = p.reshape(C, -1)    # [4*regmax+nc, H*W]
-            pred_cand = pred_flat.index_select(1, lin)  # [4*regmax+nc, N]
+            pred_flat = p.reshape(C, -1)                 # [4*regmax+nc, H*W]
+            pred_cand = pred_flat.index_select(1, lin)   # [4*regmax+nc, N]
 
-            # CLA
-            # cls Loss
-            pred_cls = pred_cand[4*self.regmax:, :].T                 # [N,nc]
-            tgt_cls = torch.nn.functional.one_hot(gt_boxes[gt_id,0].long(), self.nc).to(torch.float32)  # [N,nc]
-            Lcls = torchvision.ops.sigmoid_focal_loss(pred_cls, tgt_cls, reduction='none').sum(1)       # [N]
+            # CLA: Lcls + 1.5*Lreg + deviation
+            # Class Loss
+            pred_cls = pred_cand[4*self.regmax:, :].T  # [N,nc]
+            tgt_cls = torch.nn.functional.one_hot(gt_boxes[gt_id, 0].long(), self.nc).to(torch.float32)
+            Lcls = torchvision.ops.sigmoid_focal_loss(pred_cls, tgt_cls, reduction='none').sum(1)  # [N]
 
-            # reg → ltrb (0..1 norm)
-            pred_reg = pred_cand[:4*self.regmax, :].reshape(4, self.regmax, N)
+            # GIoU loss
+            pred_reg = pred_cand[:4*self.regmax, :].reshape(4, self.regmax, -1)
             pred_reg = torch.softmax(pred_reg, dim=1)
-            ltrb = (pred_reg * self.proj).sum(1)*(st / self.imgsz)       # [4,N]
-            l, t, r, b = ltrb[0], ltrb[1], ltrb[2], ltrb[3]            # [N]
-
-            # pred boxes (norm)
-            px1 = anc_cx - l
-            py1 = anc_cy - t
-            px2 = anc_cx + r
-            py2 = anc_cy + b
-            pred_xyxy = torch.stack([px1,py1,px2,py2], dim=1)         # [N,4]
-
-            # gt boxes (norm)
-            gt_xyxy = torchvision.ops.box_convert(gt_boxes[gt_id,1:], 'cxcywh', 'xyxy')  # [N,4]
-
-            # Lreg = GIoU (LADA paper: GIoU)
+            ltrb = (pred_reg * self.proj).sum(1) * (st / self.imgsz)  # [4,N]
+            l, t, r, b = ltrb[0], ltrb[1], ltrb[2], ltrb[3]
+            pred_xyxy = torch.stack([anc_cx - l, anc_cy - t, anc_cx + r, anc_cy + b], dim=1)  # [N,4]
+            gt_xyxy = torchvision.ops.box_convert(gt_boxes[gt_id, 1:], 'cxcywh', 'xyxy')       # [N,4]
             Lreg = torchvision.ops.generalized_box_iou_loss(pred_xyxy, gt_xyxy, reduction='none')  # [N]
 
-            # dev
+            # Deviation Loss
             gx1, gy1, gx2, gy2 = gt_xyxy.unbind(1)
-            dev_h = (torch.abs((anc_cx - gx1) - (gx2 - anc_cx)) / ( (anc_cx - gx1) + (gx2 - anc_cx) + 1e-9 ))
-            dev_v = (torch.abs((anc_cy - gy1) - (gy2 - anc_cy)) / ( (anc_cy - gy1) + (gy2 - anc_cy) + 1e-9 ))
-            dev = torch.clamp(dev_h + dev_v - 1.0, min=0.0)           # [N], <=1 → 0, >1 → dev-1
+            dev_h = (torch.abs((anc_cx - gx1) - (gx2 - anc_cx)) /
+                    ((anc_cx - gx1) + (gx2 - anc_cx) + 1e-9))
+            dev_v = (torch.abs((anc_cy - gy1) - (gy2 - anc_cy)) /
+                    ((anc_cy - gy1) + (gy2 - anc_cy) + 1e-9))
+            dev = torch.clamp(dev_h + dev_v - 1.0, min=0.0)
+            loss = Lcls + 1.5*Lreg + dev  # [N]
 
-            loss = Lcls + 1.5*Lreg + dev                              # [N]
-
-            # Best N candidates
-            # lin: [N], loss: [N]  → lin based min loss
             min_loss = torch.full((H*W,), float('inf'), device=device)
             min_loss = min_loss.scatter_reduce(0, lin, loss, reduce='amin', include_self=True)  # [H*W]
             mask = loss <= (min_loss[lin] + 1e-12)
-            sel = torch.nonzero(mask, as_tuple=False).squeeze(1)      # [H*W] eleman
-            # guarenteed for each (i,j): only one gt
+            sel = torch.nonzero(mask, as_tuple=False).squeeze(1)
             order = torch.argsort(lin[sel])
             sel = sel[order]
             lin_sel = lin[sel]
             keep = torch.ones_like(lin_sel, dtype=torch.bool)
-            keep[1:] = lin_sel[1:] != lin_sel[:-1]
+            keep[1:] = lin_sel[1:] != lin_sel[:-1] # remove duplicates
             sel = sel[keep]
 
-            # C1:
-            c1_i = ii[sel]; c1_j = jj[sel]; c1_lin = lin[sel]
-            c1_cx = anc_cx[sel]; c1_cy = anc_cy[sel]
-            c1_gtid = gt_id[sel]; c1_loss = loss[sel]                 # [M]
+            c1_i, c1_j = ii[sel], jj[sel]
+            c1_cx, c1_cy = anc_cx[sel], anc_cy[sel]
+            c1_gtid, c1_loss = gt_id[sel], loss[sel]
 
             if debug:
-                pts = []
-                for _i, _j, _cx, _cy, _gid in zip(c1_i.tolist(), c1_j.tolist(), c1_cx.tolist(), c1_cy.tolist(), c1_gtid.tolist()):
-                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
-                C1_points_by_st.append(pts)
-            else:
-                C1_points_by_st.append([])
+                for _cx, _cy, _gid in zip(c1_cx.tolist(), c1_cy.tolist(), c1_gtid.tolist()):
+                    C1_points_by_st[sidx].append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
 
-            # C2: top-k for each gt
+            # C2: top-k for each GT (just for this stride)
             if c1_gtid.numel() == 0:
-                if debug:
-                    C2_points_by_st.append([])
-                else:
-                    C2_points_by_st.append([])
-                # Protect C3
-                c3_candidates_per_st[st] = {
+                c2_candidates_per_st[st] = {
                     "i": torch.empty(0, dtype=torch.long, device=device),
                     "j": torch.empty(0, dtype=torch.long, device=device),
                     "cx": torch.empty(0, device=device),
@@ -631,116 +616,146 @@ class LADATrainer:
 
             sel_list = []
             for g in range(G):
-                m = (c1_gtid == g)  # Bool Tensor [M]
-                if not m.any(): # İf not include True
+                m = (c1_gtid == g)
+                if not m.any():
                     continue
-                l = c1_loss[m]  # 
-                kk = min(c2k, l.numel())
-                topk_idx = torch.topk(l, k=kk, largest=False).indices
+                l_ = c1_loss[m]
+                kk = min(c2k, l_.numel())
+                topk_idx = torch.topk(l_, k=kk, largest=False).indices
                 idx_global = torch.nonzero(m, as_tuple=False).squeeze(1)[topk_idx]
                 sel_list.append(idx_global)
-            if len(sel_list) > 0:
-                c2_idx = torch.cat(sel_list, 0)
-            else:
-                c2_idx = torch.empty(0, dtype=torch.long, device=device)
 
-            c2_i = c1_i[c2_idx]; c2_j = c1_j[c2_idx]
-            c2_cx = c1_cx[c2_idx]; c2_cy = c1_cy[c2_idx]
-            c2_gtid = c1_gtid[c2_idx]; c2_loss = c1_loss[c2_idx]
+            c2_idx = torch.cat(sel_list, 0) if len(sel_list) > 0 else torch.empty(0, dtype=torch.long, device=device)
 
-            if debug:
-                pts = []
-                for _i, _j, _cx, _cy, _gid in zip(c2_i.tolist(), c2_j.tolist(), c2_cx.tolist(), c2_cy.tolist(), c2_gtid.tolist()):
-                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
-                C2_points_by_st.append(pts)
-            else:
-                C2_points_by_st.append([])
+            c2_i, c2_j = c1_i[c2_idx], c1_j[c2_idx]
+            c2_cx, c2_cy = c1_cx[c2_idx], c1_cy[c2_idx]
+            c2_gtid, c2_loss = c1_gtid[c2_idx], c1_loss[c2_idx]
 
-            # C3 stride top-k
-            if c2_loss.numel() > 0:
-                kk3 = min(c3k, c2_loss.numel())
-                c3_take = torch.topk(c2_loss, k=kk3, largest=False).indices
-                c3_i = c2_i[c3_take]; c3_j = c2_j[c3_take]
-                c3_cx = c2_cx[c3_take]; c3_cy = c2_cy[c3_take]
-                c3_gtid = c2_gtid[c3_take]; c3_loss = c2_loss[c3_take]
-            else:
-                c3_i = torch.empty(0, dtype=torch.long, device=device)
-                c3_j = torch.empty(0, dtype=torch.long, device=device)
-                c3_cx = torch.empty(0, device=device)
-                c3_cy = torch.empty(0, device=device)
-                c3_gtid = torch.empty(0, dtype=torch.long, device=device)
-                c3_loss = torch.empty(0, device=device)
-
-            c3_candidates_per_st[st] = {
-                "i": c3_i, "j": c3_j, "cx": c3_cx, "cy": c3_cy, "gtid": c3_gtid, "loss": c3_loss
+            c2_candidates_per_st[st] = {
+                "i": c2_i, "j": c2_j,
+                "cx": c2_cx, "cy": c2_cy,
+                "gtid": c2_gtid, "loss": c2_loss
             }
-            all_losses_for_dlt.append(c3_loss)
 
-            if debug:
-                pts = []
-                for _i, _j, _cx, _cy, _gid in zip(c3_i.tolist(), c3_j.tolist(), c3_cx.tolist(), c3_cy.tolist(), c3_gtid.tolist()):
-                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
-                C3_points_by_st.append(pts)
-            else:
-                C3_points_by_st.append([])
+            if debug and c2_i.numel() > 0:
+                for _cx, _cy, _gid in zip(c2_cx.tolist(), c2_cy.tolist(), c2_gtid.tolist()):
+                    C2_points_by_st[sidx].append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
 
-        # DLT
-        if len(all_losses_for_dlt) > 0:
-            all_losses = torch.cat([x for x in all_losses_for_dlt if x.numel() > 0], 0)
-            avg_loss = (all_losses.mean().item() if all_losses.numel() > 0 else float('inf'))
-        else:
-            avg_loss = float('inf')
+        # 2) C3: top-k for each GT (across all strides)
+        c3_selected_per_st = {st: {"i": [], "j": [], "cx": [], "cy": [], "gtid": [], "loss": []}
+                            for st in self.strides}
+        final_selected_per_st = {st: {"i": [], "j": [], "cx": [], "cy": [], "gtid": [], "loss": []}
+                                for st in self.strides}
 
-        # Fianl
-        for p in preds:
-            st = self.imgsz // p.shape[-1]
-            H = self.grid_cache[st]["H"]; W = self.grid_cache[st]["W"]
-            cand = c3_candidates_per_st.get(st, None)
-            if cand is None or cand["i"].numel() == 0:
-                labels_per_stride.append(torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device))
-                pos_per_stride.append(torch.empty((0,2), device=device, dtype=torch.long))
-                if debug:
-                    FINAL_points_by_st.append([])
+        for g in range(G):
+            st_list, i_list, j_list, cx_list, cy_list, loss_list = [], [], [], [], [], []
+
+            for st in self.strides:
+                cand = c2_candidates_per_st.get(st, None)
+                if cand is None or cand["i"].numel() == 0:
+                    continue
+                m = (cand["gtid"] == g)
+                if not m.any():
+                    continue
+
+                cnt = int(m.sum().item())
+                st_list.append(torch.full((cnt,), st, device=device, dtype=torch.long))
+                i_list.append(cand["i"][m]);        j_list.append(cand["j"][m])
+                cx_list.append(cand["cx"][m]);      cy_list.append(cand["cy"][m])
+                loss_list.append(cand["loss"][m])
+
+            if len(loss_list) == 0:
                 continue
 
-            # DLT filter
-            keep = cand["loss"] < avg_loss
-            i_fin = cand["i"][keep]; j_fin = cand["j"][keep]
-            cx_fin = cand["cx"][keep]; cy_fin = cand["cy"][keep]
-            gid_fin = cand["gtid"][keep]
-            n_fin = i_fin.numel()
+            st_all   = torch.cat(st_list, 0)
+            i_all    = torch.cat(i_list, 0)
+            j_all    = torch.cat(j_list, 0)
+            cx_all   = torch.cat(cx_list, 0)
+            cy_all   = torch.cat(cy_list, 0)
+            loss_all = torch.cat(loss_list, 0)
 
-            # label map
-            L = torch.zeros((1, 4*self.regmax+self.nc, H, W), device=device)  # [1,C,H,W]
+            kk3 = min(c3k, loss_all.numel())
+            c3_idx = torch.topk(loss_all, k=kk3, largest=False).indices
+
+            # debug: C3 points
+            if debug:
+                for st in self.strides:
+                    m3 = (st_all[c3_idx] == st)
+                    if m3.any():
+                        for _cx, _cy in zip(cx_all[c3_idx][m3].tolist(), cy_all[c3_idx][m3].tolist()):
+                            C3_points_by_st[st2idx[st]].append([_cx, _cy, color_map[tuple(gt_boxes[g].tolist())]])
+
+            avg_g = loss_all[c3_idx].mean() # DLT (per-GT)
+            
+            keep = loss_all[c3_idx] < avg_g
+            final_idx = c3_idx[keep]
+
+            for st in self.strides:
+                m3 = (st_all[c3_idx] == st)
+                if m3.any():
+                    c3_selected_per_st[st]["i"].append(i_all[c3_idx][m3])
+                    c3_selected_per_st[st]["j"].append(j_all[c3_idx][m3])
+                    c3_selected_per_st[st]["cx"].append(cx_all[c3_idx][m3])
+                    c3_selected_per_st[st]["cy"].append(cy_all[c3_idx][m3])
+                    c3_selected_per_st[st]["gtid"].append(torch.full((int(m3.sum().item()),), g, device=device, dtype=torch.long))
+                    c3_selected_per_st[st]["loss"].append(loss_all[c3_idx][m3])
+
+                mf = (st_all[final_idx] == st)
+                if mf.any():
+                    final_selected_per_st[st]["i"].append(i_all[final_idx][mf])
+                    final_selected_per_st[st]["j"].append(j_all[final_idx][mf])
+                    final_selected_per_st[st]["cx"].append(cx_all[final_idx][mf])
+                    final_selected_per_st[st]["cy"].append(cy_all[final_idx][mf])
+                    final_selected_per_st[st]["gtid"].append(torch.full((int(mf.sum().item()),), g, device=device, dtype=torch.long))
+                    final_selected_per_st[st]["loss"].append(loss_all[final_idx][mf])
+
+                    if debug:
+                        for _cx, _cy in zip(cx_all[final_idx][mf].tolist(), cy_all[final_idx][mf].tolist()):
+                            FINAL_points_by_st[st2idx[st]].append([_cx, _cy, color_map[tuple(gt_boxes[g].tolist())]])
+
+        def _cat_or_empty_long(lst):   # list[tensor] -> tensor[0] (long)
+            return torch.cat(lst, 0) if len(lst) > 0 else torch.empty(0, dtype=torch.long, device=device)
+        def _cat_or_empty_float(lst):  # list[tensor] -> tensor[0] (float)
+            return torch.cat(lst, 0) if len(lst) > 0 else torch.empty(0, dtype=torch.float32, device=device)
+
+        for p in preds:
+            st = self.imgsz // p.shape[-1]
+            H, W = self.grid_cache[st]["H"], self.grid_cache[st]["W"]
+
+            cand = final_selected_per_st[st]
+            i_fin = _cat_or_empty_long(cand["i"])
+            j_fin = _cat_or_empty_long(cand["j"])
+            cx_fin = _cat_or_empty_float(cand["cx"])
+            cy_fin = _cat_or_empty_float(cand["cy"])
+            gid_fin = _cat_or_empty_long(cand["gtid"])
+            n_fin = int(i_fin.numel())
+
+            L = torch.zeros((1, 4*self.regmax + self.nc, H, W), device=device)
 
             if n_fin > 0:
-                # ltrb dist
-                gt_sel = gt_boxes[gid_fin] # [N,5]
-                xyxy = torchvision.ops.box_convert(gt_sel[:,1:], 'cxcywh','xyxy')  # [N,4]
-                x1,y1,x2,y2 = xyxy.unbind(1)
+                gt_sel = gt_boxes[gid_fin]  # [N,5]
+                xyxy = torchvision.ops.box_convert(gt_sel[:, 1:], 'cxcywh', 'xyxy')  # [N,4]
+                x1, y1, x2, y2 = xyxy.unbind(1)
+
                 scale = self.imgsz / st
                 l = (cx_fin - x1) * scale
                 t = (cy_fin - y1) * scale
                 r = (x2 - cx_fin) * scale
                 b = (y2 - cy_fin) * scale
-                dist_ltrb = self._distribute_vec(torch.stack([l,t,r,b], dim=1), self.regmax)  # [N,4*regmax]
 
-                cls_onehot = torch.nn.functional.one_hot(gt_sel[:,0].long(), self.nc).to(torch.float32)  # [N,nc]
+                dist_ltrb = self._distribute_vec(torch.stack([l, t, r, b], dim=1), self.regmax)  # [N,4*regmax]
+                cls_onehot = torch.nn.functional.one_hot(gt_sel[:, 0].long(), self.nc).to(torch.float32)
                 label_vec = torch.cat([dist_ltrb, cls_onehot], dim=1)  # [N, 4*regmax+nc]
 
-                # scatter to [1,C,H*W]
-                lin_fin = (i_fin * W + j_fin)  # [N]
-                L2 = L.view(1, -1, H*W)[0]     # [C,H*W]
+                lin_fin = (i_fin * W + j_fin)
+                L2 = L.view(1, -1, H*W)[0]
                 L2[:, lin_fin] = label_vec.T
 
-            labels_per_stride.append(L)
-            pos_per_stride.append(torch.stack([i_fin, j_fin], dim=1) if n_fin>0 else torch.empty((0,2), device=device, dtype=torch.long))
+                pos_per_stride.append(torch.stack([i_fin, j_fin], dim=1))
+            else:
+                pos_per_stride.append(torch.empty((0, 2), dtype=torch.long, device=device))
 
-            if debug:
-                pts = []
-                for _cx, _cy, _gid in zip(cx_fin.tolist(), cy_fin.tolist(), gid_fin.tolist()):
-                    pts.append([_cx, _cy, color_map[tuple(gt_boxes[_gid].tolist())]])
-                FINAL_points_by_st.append(pts)
+            labels_per_stride.append(L)
 
         points_and_strides = [C1_points_by_st, C2_points_by_st, C3_points_by_st, FINAL_points_by_st] if debug else None
         return labels_per_stride, pos_per_stride, points_and_strides
