@@ -202,13 +202,20 @@ class LADATrainer:
             self.last_ep += 1
 
         model = self.model.train(True)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+        head_params = list(model.head.parameters())
+        back_params = list(model.backbone.parameters())
+        optimizer = torch.optim.AdamW([
+            {'params': head_params, 'lr': 3e-3},
+            {'params': back_params, 'lr': 5e-4}
+        ], weight_decay=0.01)
+
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=0.01,
+            optimizer,
+            max_lr=[3e-3, 5e-4],
             epochs=max(1, epoch - self.last_ep),
-            steps_per_epoch=math.ceil(len(train_names)/batch)
+            steps_per_epoch=math.ceil(len(train_names)/batch),
         )
         if self.sched_state_dict is not None:
             scheduler.load_state_dict(self.sched_state_dict)
@@ -345,13 +352,6 @@ class LADATrainer:
             data = np.reshape(data, (1,5))
         return torch.from_numpy(data).to(device=self.device) # [N,5]
 
-    def __preprocess(self, x: torch.Tensor):
-        x = x.to(torch.float32)
-        x = x.permute(2, 0, 1).unsqueeze(0) # [H,W,3] -> [1,3,H,W]
-        x = torch.nn.functional.interpolate(x, size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False)
-        x = x*(1.0/255.0)
-        return x
-
     def calc_loss(self, preds: List[List[torch.Tensor]],
                   targets: List[List[torch.Tensor]],
                   positive_anchors: List[List[torch.Tensor]]):
@@ -409,7 +409,11 @@ class LADATrainer:
         cls_loss = 0.0
         for p, t in zip(pred_cls, truth_cls):
             t = t.to(dtype=p.dtype)
-            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')
+            loss_mat = torchvision.ops.sigmoid_focal_loss(p, t, reduction='none')  # [N,C]
+            pos_mask = (t.max(dim=1).values > 0)                                   # [N]
+            pos_loss = loss_mat[pos_mask].mean() if pos_mask.any() else loss_mat.mean()*0.0
+            neg_loss = loss_mat[~pos_mask].mean() if (~pos_mask).any() else loss_mat.mean()*0.0
+            cls_loss += pos_loss + 0.5 * neg_loss
 
         # 6) Loss balance
         w = [0.5, 1.5, 7.5]
@@ -443,9 +447,9 @@ class LADATrainer:
         pred = pred.reshape(4, self.regmax, -1) # [4,regmax,N]
         target = target.reshape(4, self.regmax, -1) # [4,regmax,N]
 
-        pred = torch.softmax(pred, dim=1)
-        pred = (pred*self.proj).sum(1, keepdim=False) / self.regmax  # [4,N] (scale ~ 0..1)
-        target = (target*self.proj).sum(1, keepdim=False) / self.regmax # [4,N]
+        pred = torch.softmax(pred, dim=1)        
+        pred   = (pred  * self.proj).sum(1, keepdim=False) * st
+        target = (target* self.proj).sum(1, keepdim=False) * st
 
         l,t,r,b = pred.split([1,1,1,1], dim=0) # [1,N]
         x1 = gx - l.squeeze(0)
