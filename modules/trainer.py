@@ -409,11 +409,7 @@ class LADATrainer:
         cls_loss = 0.0
         for p, t in zip(pred_cls, truth_cls):
             t = t.to(dtype=p.dtype)
-            loss_mat = torchvision.ops.sigmoid_focal_loss(p, t, reduction='none')  # [N,C]
-            pos_mask = (t.max(dim=1).values > 0)                                   # [N]
-            pos_loss = loss_mat[pos_mask].mean() if pos_mask.any() else loss_mat.mean()*0.0
-            neg_loss = loss_mat[~pos_mask].mean() if (~pos_mask).any() else loss_mat.mean()*0.0
-            cls_loss += pos_loss + 0.5 * neg_loss
+            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')            
 
         # 6) Loss balance
         w = [0.5, 1.5, 7.5]
