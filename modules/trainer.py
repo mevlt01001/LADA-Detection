@@ -187,7 +187,8 @@ class LADATrainer:
               valid_path: str=None,
               debug:bool=False,
               c2k:int=9,   # per-gt per-stride
-              c3k:int=20   # per-stride
+              c3k:int=20,   # per-stride
+              lr=0.0001
               ):
 
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
@@ -202,18 +203,13 @@ class LADATrainer:
             self.last_ep += 1
 
         model = self.model.train(True)
-        head_params = list(model.head.parameters())
-        back_params = list(model.backbone.parameters())
-        optimizer = torch.optim.AdamW([
-            {'params': head_params, 'lr': 3e-3},
-            {'params': back_params, 'lr': 5e-4}
-        ], weight_decay=0.01)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[3e-3, 5e-4],
+            max_lr=[0.05, 0.0005],
             epochs=max(1, epoch - self.last_ep),
             steps_per_epoch=math.ceil(len(train_names)/batch),
         )

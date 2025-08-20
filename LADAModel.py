@@ -34,7 +34,8 @@ class LADAModel:
               valid_path: str=None,
               debug:bool=False,
               c2k = 9, # Best 9 anchors for each stride
-              c3k = 20 # Best 20 anchors for all strides
+              c3k = 20, # Best 20 anchors for all strides,
+              lr = 0.001,
             ):
         
         if data_yaml is not None:
@@ -64,7 +65,8 @@ class LADAModel:
             valid_path=valid_path,
             debug=debug,
             c2k=c2k,
-            c3k=c3k
+            c3k=c3k,
+            lr=lr
         )
         self = trainer.model
 
