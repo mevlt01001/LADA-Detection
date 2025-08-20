@@ -113,6 +113,9 @@ def progress_bar(total:int=5,
                  percentage:float=0.0,
                  epoch:int=None,
                  loss:float=None,
+                 clsW:float=None,
+                 ciouW:float=None,
+                 dflW:float=None,
                  lr:float=None,
                  mAP_50:float=None,
                  mAP_50_95:float=None,
@@ -123,7 +126,7 @@ def progress_bar(total:int=5,
     msg = (
     f"{f'Validation | ' if val else ''}"
     f"{f'Epoch={epoch:03}' if epoch is not None else ''} "
-    f"{f'Loss={loss:<7.2f}' if loss is not None else ''} "
+    f"{f'Loss(CLS%{int(clsW*10):02}, CIoU%{int(ciouW*10):02}, DFL%{int(dflW*10):02})={loss:<7.3f}' if loss is not None else ''} "
     f"{f'LR={lr:<7.6f}' if lr is not None else ''} "
     f"{f'mAP_50={mAP_50*100:<7.2f}' if mAP_50 is not None else ''} "
     f"{f'mAP_50_95={mAP_50_95*100:<7.2f}' if mAP_50_95 is not None else ''} "
@@ -156,6 +159,8 @@ class LADATrainer:
         self.optim_state_dict = self.model.optim_state_dict
         self.sched_state_dict = self.model.sched_state_dict
         self.max_stride = max(self.strides)
+        self.loss_mode = "softmax"
+        self.loss_weights = torch.nn.Parameter(torch.zeros(3, device=self.device))  # [cls, ciou, dfl]
 
         # mAP
         self.map_metric = MeanAveragePrecision(
@@ -205,18 +210,15 @@ class LADATrainer:
             self.last_ep += 1
 
         model = self.model.train(True)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+        optimizer = torch.optim.Adam(
+            [
+                {"params": model.parameters(), "lr": lr},
+                {"params": [self.loss_weights],"lr": lr/10, "weight_decay": 0.0},
+            ]
+        )
 
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=lr*10,
-            epochs=max(1, epoch - self.last_ep),
-            steps_per_epoch=math.ceil(len(train_names)/batch),
-        )
-        if self.sched_state_dict is not None:
-            scheduler.load_state_dict(self.sched_state_dict)
 
         for ep in range(self.last_ep, epoch):
             losses = []
@@ -251,17 +253,19 @@ class LADATrainer:
                 map50 = batch_stats["map_50"].item()
                 map50_95 = batch_stats['map'].item()
 
-                loss = self.calc_loss(batch_preds_for_loss, targets, pos)
-                loss.backward()
+                loss, clsw, ciouw, dflw = self.calc_loss(batch_preds_for_loss, targets, pos)
+                loss.backward()                
                 optimizer.step()
-                scheduler.step()
                 losses.append(loss.item())
 
-                progress_bar(total=33,
+                progress_bar(total=20,
                              percentage=(i+batch_size)/max(1,len(train_names)),
                              epoch=ep+1,
                              loss=loss.item(),
-                             lr=scheduler.get_last_lr()[0],
+                             clsW=clsw,
+                             ciouW=ciouw,
+                             dflW=dflw,
+                             lr=optimizer.param_groups[0]['lr'],
                              mAP_50=map50,
                              mAP_50_95=map50_95,
                              val=False
@@ -278,7 +282,7 @@ class LADATrainer:
                         "regmax": self.regmax,
                         "model_state_dict": model.state_dict(),
                         "optim_state_dict": optimizer.state_dict(),
-                        "sched_state_dict": scheduler.state_dict(),
+                        "sched_state_dict": None,
                         "last_epoch": ep,
                         "last_batch": i+batch
                         }, f"LADA_{i+batch}.pt")
@@ -355,9 +359,16 @@ class LADATrainer:
                   targets: List[List[torch.Tensor]],
                   positive_anchors: List[List[torch.Tensor]]):
         loss = 0.0
+        cls_w = 0.0
+        ciou_w = 0.0
+        dfl_w = 0.0
         for pred, target, pos in zip(preds, targets, positive_anchors):
-            loss += self.__calc_loss(pred, target, pos)
-        return loss/len(preds)
+            Ltotal, w = self.__calc_loss(pred, target, pos)
+            loss += Ltotal
+            cls_w += w[0].item()
+            ciou_w += w[1].item()
+            dfl_w += w[2].item()
+        return loss/len(preds), cls_w/len(preds), ciou_w/len(preds), dfl_w/len(preds)
 
     def __calc_loss(self, pred: list[torch.Tensor],
                     targets: list[torch.Tensor],
@@ -408,11 +419,20 @@ class LADATrainer:
         cls_loss = 0.0
         for p, t in zip(pred_cls, truth_cls):
             t = t.to(dtype=p.dtype)
-            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')            
+            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')          
 
         # 6) Loss balance
-        w = [0.5, 1.5, 7.5]
-        return cls_loss*w[0] + ciou_loss*w[1] + dfl_loss*w[2]
+        if self.loss_mode == "softmax":
+            w = torch.softmax(self.loss_weights, dim=0) * 10
+        else:
+            w = torch.tensor([1.5,2.5,6.5], dtype=torch.float32, device=self.device)
+
+        cls_loss *= w[0]
+        ciou_loss *= w[1]
+        dfl_loss *= w[2]
+        total_loss = cls_loss + ciou_loss + dfl_loss
+
+        return total_loss, w.detach()
 
     def __calc_dfl(self, pred:torch.Tensor, target:torch.Tensor, positive_anchors:torch.Tensor):
         # pred: [4*regmax,H,W]
@@ -422,14 +442,15 @@ class LADATrainer:
         target = target.view(4, self.regmax, target.shape[-1]) # [4,regmax,N]
         pred = pred.view(4, self.regmax, pred.shape[-1])       # [4,regmax,N]
         pred = torch.log_softmax(pred, dim=1)
-        loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')
+        loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')*10
         return loss
 
     def __calc_CIoU(self, pred: torch.Tensor, target: torch.Tensor, positive_anchors: torch.Tensor):
         # pred.shape = [4*regmax, H, W]
-        st = self.imgsz//pred.shape[-1]
-        gx,gy = torch.meshgrid(torch.arange(pred.shape[-1], device=self.device),
-                               torch.arange(pred.shape[-1], device=self.device),
+        H=W=pred.shape[-1]
+        st = self.imgsz//H
+        gx,gy = torch.meshgrid(torch.arange(H, device=self.device),
+                               torch.arange(W, device=self.device),
                                indexing='xy')
         gx = gx[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
         gy = gy[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
@@ -460,7 +481,7 @@ class LADATrainer:
         y2 = gy + b.squeeze(0)
         target_xyxy = torch.stack([x1,y1,x2,y2], dim=1) # [N,4]
 
-        loss = torchvision.ops.generalized_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
+        loss = torchvision.ops.complete_box_iou_loss(pred_xyxy, target_xyxy, reduction='mean')
         return loss
 
     def create_targets(self,
