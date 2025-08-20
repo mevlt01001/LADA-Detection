@@ -113,6 +113,7 @@ def progress_bar(total:int=5,
                  percentage:float=0.0,
                  epoch:int=None,
                  loss:float=None,
+                 lr:float=None,
                  mAP_50:float=None,
                  mAP_50_95:float=None,
                  val:bool=False
@@ -123,6 +124,7 @@ def progress_bar(total:int=5,
     f"{f'Validation | ' if val else ''}"
     f"{f'Epoch={epoch:03}' if epoch is not None else ''} "
     f"{f'Loss={loss:<7.2f}' if loss is not None else ''} "
+    f"{f'LR={lr:<7.6f}' if lr is not None else ''} "
     f"{f'mAP_50={mAP_50*100:<7.2f}' if mAP_50 is not None else ''} "
     f"{f'mAP_50_95={mAP_50_95*100:<7.2f}' if mAP_50_95 is not None else ''} "
     f"{f'{percentage*100:>7.2f}%{bar}  '}"
@@ -209,7 +211,7 @@ class LADATrainer:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=0.05,
+            max_lr=lr*10,
             epochs=max(1, epoch - self.last_ep),
             steps_per_epoch=math.ceil(len(train_names)/batch),
         )
@@ -259,6 +261,7 @@ class LADATrainer:
                              percentage=(i+batch_size)/max(1,len(train_names)),
                              epoch=ep+1,
                              loss=loss.item(),
+                             lr=scheduler.get_last_lr()[0],
                              mAP_50=map50,
                              mAP_50_95=map50_95,
                              val=False
