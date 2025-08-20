@@ -195,7 +195,8 @@ class LADATrainer:
               debug:bool=False,
               c2k:int=9,   # per-gt per-stride
               c3k:int=20,   # per-stride
-              lr=0.0001
+              lr=0.001,
+              max_lr=None
               ):
 
         train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
@@ -216,9 +217,18 @@ class LADATrainer:
                 {"params": [self.loss_weights],"lr": lr/10, "weight_decay": 0.0},
             ]
         )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[(lr if max_lr is None else max_lr), (lr/10 if max_lr is None else max_lr/10)],
+            steps_per_epoch=len(train_names)//batch,
+            epochs=epoch
+        )
 
         if self.optim_state_dict is not None:
             optimizer.load_state_dict(self.optim_state_dict)
+
+        if self.sched_state_dict is not None:
+            scheduler.load_state_dict(self.sched_state_dict)
 
         for ep in range(self.last_ep, epoch):
             losses = []
@@ -256,6 +266,8 @@ class LADATrainer:
                 loss, clsw, ciouw, dflw = self.calc_loss(batch_preds_for_loss, targets, pos)
                 loss.backward()                
                 optimizer.step()
+                if max_lr is not None:
+                    scheduler.step()
                 losses.append(loss.item())
 
                 progress_bar(total=20,
@@ -282,7 +294,7 @@ class LADATrainer:
                         "regmax": self.regmax,
                         "model_state_dict": model.state_dict(),
                         "optim_state_dict": optimizer.state_dict(),
-                        "sched_state_dict": None,
+                        "sched_state_dict": scheduler.state_dict(),
                         "last_epoch": ep,
                         "last_batch": i+batch
                         }, f"LADA_{i+batch}.pt")

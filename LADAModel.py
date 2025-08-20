@@ -36,6 +36,7 @@ class LADAModel:
               c2k = 9, # Best 9 anchors for each stride
               c3k = 20, # Best 20 anchors for all strides,
               lr = 0.001,
+              max_lr=None
             ):
         
         if data_yaml is not None:
@@ -66,7 +67,8 @@ class LADAModel:
             debug=debug,
             c2k=c2k,
             c3k=c3k,
-            lr=lr
+            lr=lr,
+            max_lr=max_lr
         )
         self = trainer.model
 
