@@ -438,8 +438,8 @@ class LADATrainer:
                                indexing='xy')
         gx = gx[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
         gy = gy[positive_anchors[:, 0], positive_anchors[:, 1]].float() # [N]
-        gx = (gx+0.5)*st / self.imgsz  # normalize to 0..1
-        gy = (gy+0.5)*st / self.imgsz
+        gx = (gx+0.5)*st
+        gy = (gy+0.5)*st
 
         pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax,N]
         target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]] # [4*regmax,N]
