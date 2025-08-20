@@ -209,7 +209,7 @@ class LADATrainer:
             optimizer.load_state_dict(self.optim_state_dict)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[0.05, 0.0005],
+            max_lr=0.05,
             epochs=max(1, epoch - self.last_ep),
             steps_per_epoch=math.ceil(len(train_names)/batch),
         )
