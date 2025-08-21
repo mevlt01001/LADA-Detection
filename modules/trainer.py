@@ -441,7 +441,7 @@ class LADATrainer:
         
         cls_loss *= w[0]
         ciou_loss *= w[1]
-        dfl_loss *= 1.5
+        dfl_loss *= w[2]
         total_loss = cls_loss + ciou_loss + dfl_loss
 
         return total_loss, w.detach()
