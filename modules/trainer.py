@@ -159,7 +159,7 @@ class LADATrainer:
         self.optim_state_dict = self.model.optim_state_dict
         self.sched_state_dict = self.model.sched_state_dict
         self.max_stride = max(self.strides)
-        self.loss_mode = "softmax"
+        self.loss_mode = "classic"
         self.loss_weights = torch.nn.Parameter(torch.zeros(3, device=self.device))  # [cls, ciou, dfl]
 
         # mAP
@@ -214,7 +214,7 @@ class LADATrainer:
         optimizer = torch.optim.Adam(
             [
                 {"params": model.parameters(), "lr": lr},
-                {"params": [self.loss_weights],"lr": lr/10, "weight_decay": 0.0},
+                {"params": [self.loss_weights],"lr": lr/50, "weight_decay": 0.0},
             ]
         )
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -427,21 +427,21 @@ class LADATrainer:
                 continue
             ciou_loss += self.__calc_CIoU(p, t, pos)
 
-        # 5) Classification focal
+        # 5) Classification loss
         cls_loss = 0.0
         for p, t in zip(pred_cls, truth_cls):
             t = t.to(dtype=p.dtype)
-            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')          
+            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')
 
         # 6) Loss balance
         if self.loss_mode == "softmax":
-            w = torch.softmax(self.loss_weights, dim=0) * 10
+            w = torch.softmax(self.loss_weights, dim=0)*10
         else:
-            w = torch.tensor([1.5,2.5,6.5], dtype=torch.float32, device=self.device)
-
+            w = torch.tensor([1.5,3.5,5.0], dtype=torch.float32, device=self.device)
+        
         cls_loss *= w[0]
         ciou_loss *= w[1]
-        dfl_loss *= w[2]
+        dfl_loss *= 1.5
         total_loss = cls_loss + ciou_loss + dfl_loss
 
         return total_loss, w.detach()
@@ -454,7 +454,7 @@ class LADATrainer:
         target = target.view(4, self.regmax, target.shape[-1]) # [4,regmax,N]
         pred = pred.view(4, self.regmax, pred.shape[-1])       # [4,regmax,N]
         pred = torch.log_softmax(pred, dim=1)
-        loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')*10
+        loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')
         return loss
 
     def __calc_CIoU(self, pred: torch.Tensor, target: torch.Tensor, positive_anchors: torch.Tensor):
