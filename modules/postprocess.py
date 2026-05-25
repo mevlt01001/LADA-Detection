@@ -22,7 +22,7 @@ class Postprocess(torch.nn.Module):
         xyxy, scores = torch.split(x, (4, x.shape[2]-4), dim=2)
 
         score_vals, cls_ids = scores.max(2)
-        mask = score_vals > (0.005 if self.score_thres is None else self.score_thres)
+        mask = score_vals > (0.3 if self.score_thres is None else self.score_thres)
 
         out = []
         for _xyxy, _score_vals, _cls_ids, _mask in zip(xyxy, score_vals, cls_ids, mask):

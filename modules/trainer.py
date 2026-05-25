@@ -199,8 +199,8 @@ class LADATrainer:
               max_lr=None
               ):
 
-        train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(train_path,"images")))))
-        valid_names = None if valid_path is None else np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(os.path.join(valid_path,"images")))))
+        train_names = np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(train_path))))
+        valid_names = None if valid_path is None else np.array(list(set(os.path.splitext(file_name)[0] for file_name in os.listdir(valid_path))))
 
         if self.last_ep/epoch > 0.99:
             self.last_ep = 0
@@ -256,12 +256,12 @@ class LADATrainer:
                             batch_pt_st[0],
                             model.cls_names)
 
-                batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
-                self.map_metric.update(batch_pred_dicts, batch_target_dicts)
-                batch_stats = self.map_metric.compute()
-                self.map_metric.reset()
-                map50 = batch_stats["map_50"].item()
-                map50_95 = batch_stats['map'].item()
+                # batch_pred_dicts, batch_target_dicts = self.batch_eval(pred_boxes, gt_boxes)
+                # self.map_metric.update(batch_pred_dicts, batch_target_dicts)
+                # batch_stats = self.map_metric.compute()
+                # self.map_metric.reset()
+                map50 = None #batch_stats["map_50"].item()
+                map50_95 = None #batch_stats['map'].item()
 
                 loss, clsw, ciouw, dflw = self.calc_loss(batch_preds_for_loss, targets, pos)
                 loss.backward()                
@@ -339,8 +339,8 @@ class LADATrainer:
         images = []
         bboxes = []
         for file_name in names:
-            image = self.__load_image(os.path.join(path,"images", file_name))
-            bbox = self.__load_gt_boxes(os.path.join(path,"labels", file_name))
+            image = self.__load_image(os.path.join(path, file_name))
+            bbox = self.__load_gt_boxes(os.path.join(os.path.dirname(path)+"/labels", file_name))
             if bbox is None:
                 continue
             images.append(image)
@@ -429,15 +429,20 @@ class LADATrainer:
 
         # 5) Classification loss
         cls_loss = 0.0
+        num_pos = sum([pos.shape[0] for pos in positive_anchors])
+        num_pos = max(1, num_pos) # Prevent division by zero
+        
         for p, t in zip(pred_cls, truth_cls):
             t = t.to(dtype=p.dtype)
-            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='mean')
+            cls_loss += torchvision.ops.sigmoid_focal_loss(p, t, reduction='sum')
+        
+        cls_loss /= num_pos
 
         # 6) Loss balance
         if self.loss_mode == "softmax":
             w = torch.softmax(self.loss_weights, dim=0)*10
         else:
-            w = torch.tensor([1.5,3.5,5.0], dtype=torch.float32, device=self.device)
+            w = torch.tensor([0.5, 1.5, 7.5], dtype=torch.float32, device=self.device)
         
         cls_loss *= w[0]
         ciou_loss *= w[1]
@@ -451,8 +456,9 @@ class LADATrainer:
         pred = pred[:, positive_anchors[:, 0], positive_anchors[:, 1]]   # [4*regmax,N]
         target = target[:, positive_anchors[:, 0], positive_anchors[:, 1]]# [4*regmax,N]
 
-        target = target.view(4, self.regmax, target.shape[-1]) # [4,regmax,N]
-        pred = pred.view(4, self.regmax, pred.shape[-1])       # [4,regmax,N]
+        target = target.view(4, self.regmax, -1).permute(0, 2, 1).reshape(-1, self.regmax)
+        pred = pred.view(4, self.regmax, -1).permute(0, 2, 1).reshape(-1, self.regmax)
+        
         pred = torch.log_softmax(pred, dim=1)
         loss = torch.nn.functional.kl_div(pred, target, reduction='batchmean')
         return loss
@@ -832,12 +838,18 @@ class LADATrainer:
                                          "scores": torch.zeros((0,), device=self.device),
                                          "labels": torch.zeros((0,), device=self.device, dtype=torch.long)})
             else:
-                xyxy = pboxes[:, :4]   # [N,4]
-                scores = pboxes[:, 4]  # [N]
-                cls = pboxes[:, 5]     # [N]
-                batch_pred_dicts.append({"boxes": xyxy,
-                                         "scores": scores,
-                                         "labels": cls.long()})
+                xyxy = pboxes[:, :4]   
+                scores = pboxes[:, 4]  
+                cls = pboxes[:, 5]     
+
+                conf_mask = scores > 0.05
+                xyxy, scores, cls = xyxy[conf_mask], scores[conf_mask], cls[conf_mask]
+                
+                keep_idx = torchvision.ops.batched_nms(xyxy, scores, cls, iou_threshold=0.6)
+                
+                batch_pred_dicts.append({"boxes": xyxy[keep_idx],
+                                         "scores": scores[keep_idx],
+                                         "labels": cls[keep_idx].long()})
 
         for tboxes in gt_boxes:
             if tboxes.numel() == 0:

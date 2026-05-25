@@ -11,7 +11,7 @@ class LADAModel:
                  models: list[UltrlyticsModel]|str,
                  imgsz:int=640, 
                  regmax:int=None, 
-                 device=torch.device("cpu"),
+                 device=torch.device("cuda"),
                  last_epoch:int=0,
                  last_batch:int=0,
                  optim_state_dict:dict=None,
@@ -35,7 +35,7 @@ class LADAModel:
               debug:bool=False,
               c2k = 9, # Best 9 anchors for each stride
               c3k = 20, # Best 20 anchors for all strides,
-              lr = 0.001,
+              lr = 0.01,
               max_lr=None
             ):
         
@@ -43,9 +43,9 @@ class LADAModel:
             with open(data_yaml, "r", encoding="utf-8") as f:
                 yaml = YAML.safe_load(f)
 
-        train_path = os.path.dirname(os.path.abspath(os.path.join(data_yaml,yaml["train"])))
-        valid_path = os.path.dirname(os.path.abspath(os.path.join(data_yaml,yaml["val"]))) if "val" in yaml else None
-        valid_path = valid_path if os.path.exists(valid_path) else None        
+        base = os.path.dirname(os.path.abspath(data_yaml))  # directory containing the yaml
+        train_path = os.path.abspath(os.path.join(base, yaml["train"]))
+        valid_path = os.path.abspath(os.path.join(base, yaml["val"])) if "val" in yaml else None
         
         self.cls_names = yaml["names"] if "names" in yaml else None
         self.nc = yaml["nc"] if "nc" in yaml else len(self.cls_names) if self.cls_names is not None else None
@@ -56,7 +56,7 @@ class LADAModel:
         elif train_path is None:
             raise ValueError("You must specify either data_yaml or train_path.")
         
-        self.__load_model()
+        self.load_model()
 
         trainer = LADATrainer(model=self.model)
         trainer.train(
@@ -68,9 +68,9 @@ class LADAModel:
             c2k=c2k,
             c3k=c3k,
             lr=lr,
-            max_lr=max_lr
+            max_lr=lr
         )
-        self = trainer.model
+        self.model = trainer.model
 
     def export(self, 
                format:str, 
@@ -91,7 +91,7 @@ class LADAModel:
         
         dummy = torch.zeros(1, 3, self.model.imgsz, self.model.imgsz, device=self.model.device)
 
-        self.__load_model()
+        self.load_model()
         
         if format == "onnx":
             torch.onnx.export(
@@ -122,7 +122,7 @@ class LADAModel:
                     "last_batch": self.last_batch,
                     }, path)
 
-    def __load_model(self):
+    def load_model(self):
         if type(self.models) == str:
             self.model = Model.from_ckpt(
                 checkpoint_path=self.models,
@@ -145,7 +145,8 @@ class LADAModel:
     def predict(self, 
                 source:str|torch.Tensor, 
                 save_path:str="inference"):
-        self.__load_model()
+        if not hasattr(self, 'model') or self.model is None:
+            self.load_model()
         self.model = self.model.train(False)
         if type(source) == str:
             if os.path.exists(source):
